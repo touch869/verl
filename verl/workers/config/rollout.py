@@ -33,6 +33,7 @@ __all__ = [
     "RolloutConfig",
     "CheckpointEngineConfig",
     "SkipConfig",
+    "RouterConfig",
 ]
 
 
@@ -158,6 +159,20 @@ class CheckpointEngineConfig(BaseConfig):
 
 
 @dataclass
+class RouterConfig(BaseConfig):
+    """Configuration for rollout request load balancing.
+
+    Two modes:
+    - ``global_sticky_inflight``: Built-in sticky-session + least-inflight strategy.
+    - ``plugin_extension``: User-defined custom strategy. ``router_config_path`` must
+      point to a YAML file containing ``router_class`` and optional kwargs.
+    """
+
+    router_strategy: str = "global_sticky_inflight"
+    router_config_path: Optional[str] = None
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {
         "max_model_len",
@@ -280,6 +295,8 @@ class RolloutConfig(BaseConfig):
     qat: Optional[dict] = None
 
     disaggregation: DisaggregationConfig = field(default_factory=DisaggregationConfig)
+
+    router: RouterConfig = field(default_factory=RouterConfig)
 
     def __post_init__(self):
         """Validate the rollout config"""
