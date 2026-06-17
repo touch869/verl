@@ -286,3 +286,68 @@ class TestGetRouterHandlePluginExtension:
         kwargs = ray.get(lb.get_router_kwargs.remote())
         assert kwargs.get("extra_param") == "hello"
         assert kwargs.get("another_param") == 42
+
+
+class TestResolveConfigPath:
+    """Tests for ``_resolve_config_path`` (pkg:// package-relative URIs).
+
+    Covers §5.5 D01-D04 of detailed_config.md:
+    pkg:// 解析为包目录绝对路径、坏 URI / 包不存在的错误路径、非 pkg:// 按文件系统处理。
+
+    注意：用 ``verl`` 包自身测试 pkg:// 机制（verl 测试环境必然可导入），
+    避免 hardcode 依赖 ``uni_agent``（生产用例是 ``pkg://uni_agent.llm_router.configs/...``）。
+    """
+
+    def test_d01_pkg_resolves_to_abs_path(self):
+        """D01: pkg:// 解析为包目录绝对路径，文件存在。"""
+        from verl.workers.rollout.router import _resolve_config_path
+        import os
+        resolved = _resolve_config_path("pkg://verl/__init__.py")
+        assert os.path.isabs(resolved)
+        assert resolved.endswith(os.path.join("verl", "__init__.py"))
+        assert os.path.isfile(resolved)
+
+    def test_d02_pkg_missing_rel_path_raises(self):
+        """D02: pkg:// 缺相对路径 → ValueError。"""
+        from verl.workers.rollout.router import _resolve_config_path
+        with pytest.raises(ValueError, match="pkg://"):
+            _resolve_config_path("pkg://verl")
+
+    def test_d03_pkg_not_found_raises(self):
+        """D03: pkg:// 包不存在 → ImportError。"""
+        from verl.workers.rollout.router import _resolve_config_path
+        with pytest.raises(ImportError, match="Package 'no_such_pkg' not found"):
+            _resolve_config_path("pkg://no_such_pkg/x.yaml")
+
+    def test_d04_filesystem_path_handling(self):
+        """D04: 非 pkg:// 路径按文件系统处理（绝对原样、相对转 CWD 绝对）。"""
+        from verl.workers.rollout.router import _resolve_config_path
+        import os
+        # 绝对路径原样返回
+        assert _resolve_config_path("/abs/path/router.yaml") == "/abs/path/router.yaml"
+        # 相对路径解析为 CWD 绝对路径
+        rel = _resolve_config_path("relative/router.yaml")
+        assert os.path.isabs(rel)
+        assert rel == os.path.abspath("relative/router.yaml")
+
+    def test_d04b_pkg_file_not_exist(self, ray_session):
+        """D04b: pkg:// 包存在但文件不存在 → FileNotFoundError (via _load_router_yaml)。"""
+        config = RouterConfig(
+            router_strategy="plugin_extension",
+            router_config_path="pkg://verl/nonexistent_router.yaml",
+        )
+        with pytest.raises(FileNotFoundError, match="Router config file not found"):
+            get_router_handle(servers={"s0": None}, router_config=config)
+
+    def test_d06_router_class_resolved_via_importlib(self, ray_session):
+        """D06: VeRL 读 router_class → importlib 定位类（正常路径）。"""
+        from verl.workers.rollout.router import _resolve_router_class
+        fqn = __name__ + "._MockPluginLoadBalancer"
+        cls = _resolve_router_class({"router_class": fqn})
+        assert cls is _MockPluginLoadBalancer
+
+    def test_d07_missing_router_class_raises(self, ray_session):
+        """D07: 缺 router_class → ValueError。"""
+        from verl.workers.rollout.router import _resolve_router_class
+        with pytest.raises(ValueError, match="must contain 'router_class'"):
+            _resolve_router_class({})

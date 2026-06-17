@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import importlib.util
 import logging
 import os
 from typing import Any, Callable, Protocol
-from omegaconf import OmegaConf
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+from omegaconf import DictConfig, OmegaConf
 
 import ray
 from cachetools import LRUCache
@@ -245,8 +248,47 @@ def _create_global_sticky_inflight(
         max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
     )
 
+def _resolve_config_path(config_path: str) -> str:
+    """Resolve a router config path to an absolute filesystem path.
+
+    Supports two forms:
+
+    - ``pkg://<package>/<rel/path>``: resolved against an installed Python
+      package directory (works for regular packages and namespace dirs).
+      Example: ``pkg://uni_agent.llm_router.configs/kvc_aware_router.yaml``.
+    - Any other value: treated as a filesystem path (absolute or CWD-relative).
+
+    Returns the absolute path; raises ``ValueError``/``ImportError`` on bad input.
+    """
+    if config_path.startswith("pkg://"):
+        rest = config_path[len("pkg://"):]
+        pkg_name, sep, rel_path = rest.partition("/")
+        if not sep or not rel_path:
+            raise ValueError(
+                f"Invalid pkg:// URI '{config_path}': expected "
+                f"'pkg://<package>/<relative/path>'"
+            )
+        try:
+            spec = importlib.util.find_spec(pkg_name)
+        except (ImportError, ValueError) as e:
+            raise ImportError(f"Cannot resolve package '{pkg_name}': {e}") from e
+        if spec is None or not spec.submodule_search_locations:
+            raise ImportError(
+                f"Package '{pkg_name}' not found or has no __path__ "
+                f"(is it installed?)."
+            )
+        pkg_dir = os.path.abspath(next(iter(spec.submodule_search_locations)))
+        return os.path.join(pkg_dir, rel_path)
+    return os.path.abspath(config_path)
+
+
 def _load_router_yaml(router_config: RouterConfig) -> dict:
-    """Load a router YAML configuration file.
+    """Load a router YAML configuration, resolving Hydra ``defaults`` composition.
+
+    Unlike ``OmegaConf.load``, this expands the ``defaults`` block so referenced
+    sub-configs (strategies, collectors, cache_store) are merged into the final
+    config. ``router_config_path`` is resolved via :func:`_resolve_config_path`
+    (supports ``pkg://`` package-relative URIs and plain filesystem paths).
     """
     config_path = router_config.get("router_config_path", None)
     if not config_path:
@@ -255,13 +297,21 @@ def _load_router_yaml(router_config: RouterConfig) -> dict:
             "pointing to a YAML file."
         )
 
-    try:
-        cfg = OmegaConf.load(config_path)
-        return OmegaConf.to_container(cfg, resolve=True)
-    except FileNotFoundError:
-        raise FileNotFoundError(
-            f"Router config file not found: {config_path}"
-        )
+    full_path = _resolve_config_path(config_path)
+    if not os.path.isfile(full_path):
+        raise FileNotFoundError(f"Router config file not found: {full_path}")
+
+    config_dir = os.path.dirname(full_path)
+    config_name = os.path.basename(full_path)
+    for ext in (".yaml", ".yml"):
+        if config_name.endswith(ext):
+            config_name = config_name[: -len(ext)]
+            break
+
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        cfg: DictConfig = compose(config_name=config_name)
+    return OmegaConf.to_container(cfg, resolve=True)
 
 def _resolve_router_class(yaml_config: dict) -> type:
     """Validate and import a router class from YAML config.
