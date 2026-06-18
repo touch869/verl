@@ -142,6 +142,7 @@ class vLLMHttpServer:
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
+        self._kv_events_endpoints = None
 
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
@@ -181,6 +182,13 @@ class vLLMHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
+
+    def get_kv_events_endpoints(self):
+        """Get kv-events ZMQ endpoint addresses.
+
+        Returns list [endpoint, replay_endpoint] or None.
+        """
+        return self._kv_events_endpoints
 
     @property
     def lora_as_adapter(self) -> bool:
@@ -834,7 +842,22 @@ class vLLMHttpServer:
 
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
         """Mutate engine_kwargs in-place before the CLI args dict is built. No-op by default."""
-        pass
+        # Use OS-assigned free ports for kv-events ZMQ sockets to avoid port
+        # conflicts across replicas. vLLM's ZmqEventPublisher further offsets
+        # by data_parallel_rank inside each replica, so a fixed port offset
+        # scheme is fragile — get_free_port is simpler and reliable.
+        kv_events_config = engine_kwargs.get("kv-events-config")
+        if kv_events_config and isinstance(kv_events_config, dict):
+            endpoints = []
+            for key, default in [("endpoint", "tcp://*:5557"), ("replay_endpoint", "tcp://*:5558")]:
+                ep = kv_events_config.get(key, default)
+                if "tcp" in ep and ":" in ep:
+                    idx = ep.rfind(":")
+                    addr = ep[:idx]
+                    free_port, _ = get_free_port(self._server_address)
+                    kv_events_config[key] = f"{addr}:{free_port}"
+                    endpoints.append(f"{self._server_address}:{free_port}")
+            self._kv_events_endpoints = endpoints
 
     def _get_override_generation_config(self) -> dict:
         """Return the override_generation_config dict."""
