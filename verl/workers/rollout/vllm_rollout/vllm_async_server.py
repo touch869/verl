@@ -847,7 +847,7 @@ class vLLMHttpServer:
         # by data_parallel_rank inside each replica, so a fixed port offset
         # scheme is fragile — get_free_port is simpler and reliable.
         kv_events_config = engine_kwargs.get("kv-events-config")
-        if kv_events_config and isinstance(kv_events_config, dict):
+        if kv_events_config and kv_events_config.get("enable_kv_cache_events", False):
             endpoints = []
             for key, default in [("endpoint", "tcp://*:5557"), ("replay_endpoint", "tcp://*:5558")]:
                 ep = kv_events_config.get(key, default)
@@ -857,6 +857,11 @@ class vLLMHttpServer:
                     free_port, _ = get_free_port(self._server_address)
                     kv_events_config[key] = f"{addr}:{free_port}"
                     endpoints.append(f"{self._server_address}:{free_port}")
+
+            publisher = kv_events_config.get("publisher", "zmq")
+            topic = kv_events_config.get("topic", "kv-event")
+            endpoints.extend([publisher, topic])
+
             self._kv_events_endpoints = endpoints
 
     def _get_override_generation_config(self) -> dict:
