@@ -1,3 +1,4 @@
+
 # Target class for this configuration
 _target_: verl.workers.config.RolloutConfig
 
@@ -134,6 +135,11 @@ over_sample_rate: 0
 # to reduce peak memory during training-rollout transition.
 # This is only effective for SGLang rollout.
 multi_stage_wake_up: false
+
+# Load balancer configuration for routing requests across inference replicas
+# - global_sticky_inflight: sticky session by request_id + least-inflight server selection.
+# - kv_cache_aware : routes requests to maximize cache hit rates and minimize recomputation.
+router_strategy: global_sticky_inflight
 
 # Extra inference engine arguments (vllm, sglang, trtllm), please refer vllm/sglang/trtllm official doc for detail
 engine_kwargs:

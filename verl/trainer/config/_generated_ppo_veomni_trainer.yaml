@@ -277,6 +277,7 @@ actor_rollout_ref:
     'n': 1
     over_sample_rate: 0
     multi_stage_wake_up: false
+    router_strategy: global_sticky_inflight
     engine_kwargs:
       vllm: {}
       sglang: {}
