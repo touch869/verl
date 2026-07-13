@@ -143,6 +143,14 @@ class vLLMHttpServer:
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
         self._kv_events_endpoints = None
+        # Alive sockets reserving the kv-events ZMQ ports from assignment
+        # (_preprocess_engine_kwargs, during __init__) until the vLLM engine
+        # actually binds them (run_server/run_headless). Without holding these,
+        # get_free_port released the port immediately and a concurrently-
+        # starting replica could be handed the same port → probabilistic
+        # EADDRINUSE when vLLM's ZmqEventPublisher binds. See get_free_port
+        # `with_alive_sock` docstring in verl/utils/net_utils.py.
+        self._kv_events_reservation_socks: list = []
 
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
@@ -412,6 +420,11 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
+        # Release the kv-events port reservations now — vLLM's ZmqEventPublisher
+        # binds these ports during/from from_vllm_config just below. Holding any
+        # longer would block the bind (port still occupied by the probe socket).
+        self._release_kv_events_reservations()
+
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
         # Don't keep the dummy data in memory
@@ -449,6 +462,9 @@ class vLLMHttpServer:
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
+        # Engine is built inside vLLM's run_headless below — release the kv-events
+        # port reservations now so the ZmqEventPublisher can bind them.
+        self._release_kv_events_reservations()
         args.api_server_count = 0
 
         def run_headless_wrapper():
@@ -863,7 +879,12 @@ class vLLMHttpServer:
                 if "tcp" in ep and ":" in ep:
                     idx = ep.rfind(":")
                     addr = ep[:idx]
-                    free_port, _ = get_free_port(self._server_address)
+                    # Hold the probe socket open (with_alive_sock) so the port
+                    # stays reserved across the __init__ → engine-bind gap.
+                    # Released in run_server/run_headless right before the bind.
+                    free_port, sock = get_free_port(self._server_address, with_alive_sock=True)
+                    if sock is not None:
+                        self._kv_events_reservation_socks.append(sock)
                     kv_events_config[key] = f"{addr}:{free_port}"
                     endpoints.append(f"{self._server_address}:{free_port}")
 
@@ -872,6 +893,23 @@ class vLLMHttpServer:
             endpoints.extend([publisher, topic])
 
             self._kv_events_endpoints = endpoints
+
+    def _release_kv_events_reservations(self) -> None:
+        """Close the kv-events port-reservation sockets so vLLM can bind them.
+
+        Called at the latest verl-controlled point before the engine binds
+        (run_server: just before AsyncLLM.from_vllm_config; run_headless:
+        method start, since the engine is built inside vLLM's run_headless).
+        Releasing here (not earlier) keeps the TOCTOU window minimal: the port
+        was reserved through __init__/arg-building, and is freed only an instant
+        before vLLM's ZmqEventPublisher binds it.
+        """
+        for sock in self._kv_events_reservation_socks:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        self._kv_events_reservation_socks.clear()
 
     def _get_override_generation_config(self) -> dict:
         """Return the override_generation_config dict."""
