@@ -1,0 +1,52 @@
+# Local docker sandbox config — c48 variant for the 3090 fully_async-repro experiment.
+#
+# concurrency: 48  →  48 // num_workers(3) = 16 per-worker × 3 = 48 total agent-layer
+# concurrency, aligned with vllm --max-num-seqs 16 × dp 3 = 48. Base is
+# agent_config_localdocker.yaml (concurrency 32 → only 30 total: 32//3=10 × 3), where the
+# agent layer binds BELOW the 48 target (uni_agent/agent_loop.py:57-61). Use this variant
+# for pilot + main 2×2 matrix. See planning/20260702-verl-fullyasync-rl-3090-repro/findings.md §7.
+#
+# Replace <DATA_DIR> with your host data path (where swe_wheels lives).
+# 147 (workhis-confirmed 2026-07-02): /data1/hgq/swe_wheels → <DATA_DIR> = /data1/hgq
+- name: swe_agent
+
+  _target_: uni_agent.agent_loop.UniAgentLoop
+
+  concurrency: 48
+  log_dir: /tmp/swebench_llm_router
+  mask_abnormal_exit_traj: false
+
+  interaction:
+    action_timeout: 300
+    max_turns: 100
+
+  env:
+    deployment:
+      type: local
+      command: "/usr/bin/python3 -m pip install -q --find-links /wheels swe-rex -i https://pypi.tuna.tsinghua.edu.cn/simple && /usr/bin/python3 -m swerex.server --auth-token {token}"
+      timeout: 600
+      startup_timeout: 1200
+      container_runtime: docker
+      extra_run_args:
+        - "-v"
+        - "/data1/hgq/swe_wheels:/wheels:ro"
+    env_variables:
+      PIP_PROGRESS_BAR: "off"
+      PIP_CACHE_DIR: "~/.cache/pip"
+      PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"
+      PIP_TRUSTED_HOST: "pypi.tuna.tsinghua.edu.cn"
+      PAGER: "cat"
+      MANPAGER: "cat"
+      LESS: "-R"
+      TQDM_DISABLE: "1"
+      GIT_PAGER: "cat"
+
+  tool_parser: hermes
+
+  tools:
+    - name: str_replace_editor
+    - name: execute_bash
+    - name: submit
+
+  reward:
+    eval_timeout: 600
