@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""verl rollout router — registry, protocol, and dispatch."""
 
-from .base import RequestLoadBalancer, get_router_handle
+"""Runtime strategies (public surface: ``route`` entrypoint + registry)."""
 
-__all__ = ["get_router_handle", "RequestLoadBalancer"]
+from .base import ReplicaInfo
+from .registry import StrategyRegistry
+from .routing import route
 
-# Trigger strategy registration (decorator side-effects at import time)
-from . import global_balancer  # noqa: E402, F401
-from . import kvcaware         # noqa: E402, F401
+# Concrete strategies self-register on import; kvc_aware lands in a later
+# commit, so the registry is empty at this commit.
+__all__ = ["ReplicaInfo", "StrategyRegistry", "route"]

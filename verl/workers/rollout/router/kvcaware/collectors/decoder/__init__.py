@@ -11,12 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""verl rollout router — registry, protocol, and dispatch."""
 
-from .base import RequestLoadBalancer, get_router_handle
+"""Decoder base types — imported by ``collector.py``."""
 
-__all__ = ["get_router_handle", "RequestLoadBalancer"]
+from .base import Decoder, KVCacheUpdate, MetricsUpdate, StickyUpdate
 
-# Trigger strategy registration (decorator side-effects at import time)
-from . import global_balancer  # noqa: E402, F401
-from . import kvcaware         # noqa: E402, F401
+__all__ = ["Decoder", "KVCacheUpdate", "MetricsUpdate", "StickyUpdate"]
