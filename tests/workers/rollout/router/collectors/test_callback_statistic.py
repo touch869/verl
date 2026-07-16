@@ -49,7 +49,7 @@ class TestStatisticEvent:
 
     def test_frozen(self):
         ev = StatisticEvent("on_acquire")
-        with pytest.raises(Exception):
+        with pytest.raises(AttributeError):
             ev.event = "x"  # type: ignore[misc]
 
     def test_on_servers_removed_carries_tuple(self):
@@ -59,18 +59,14 @@ class TestStatisticEvent:
 
 class TestStickyDecoder:
     def test_on_acquire_emits_put(self):
-        upd = StickyDecoder().decode(
-            StatisticEvent("on_acquire", request_id="r1", replica_id="s0"), ""
-        )
+        upd = StickyDecoder().decode(StatisticEvent("on_acquire", request_id="r1", replica_id="s0"), "")
         assert isinstance(upd, StickyUpdate)
         assert upd.action == "put"
         assert upd.request_id == "r1"
         assert upd.replica_id == "s0"
 
     def test_on_servers_removed_emits_invalidate_replica(self):
-        upd = StickyDecoder().decode(
-            StatisticEvent("on_servers_removed", server_ids=["s0", "s1"]), ""
-        )
+        upd = StickyDecoder().decode(StatisticEvent("on_servers_removed", server_ids=["s0", "s1"]), "")
         assert isinstance(upd, StickyUpdate)
         assert upd.action == "invalidate_replica"
         assert upd.replica_ids == ("s0", "s1")
@@ -89,18 +85,14 @@ class TestStickyDecoder:
 
 class TestInflightDecoder:
     def test_on_acquire_emits_plus_one_delta(self):
-        upd = InflightDecoder().decode(
-            StatisticEvent("on_acquire", replica_id="s0"), ""
-        )
+        upd = InflightDecoder().decode(StatisticEvent("on_acquire", replica_id="s0"), "")
         assert isinstance(upd, MetricsUpdate)
         assert upd.node_id == "s0"
         assert upd.metrics == {MetricKey.INFLIGHT_COUNT: 1}
         assert upd.is_delta is True
 
     def test_on_release_emits_minus_one_delta(self):
-        upd = InflightDecoder().decode(
-            StatisticEvent("on_release", replica_id="s0"), ""
-        )
+        upd = InflightDecoder().decode(StatisticEvent("on_release", replica_id="s0"), "")
         assert isinstance(upd, MetricsUpdate)
         assert upd.metrics == {MetricKey.INFLIGHT_COUNT: -1}
         assert upd.is_delta is True
@@ -109,12 +101,7 @@ class TestInflightDecoder:
         # Faithful to verl: removal must NOT zero the counter — release
         # symmetry maintains it (zeroing would let a later release drive it
         # negative).
-        assert (
-            InflightDecoder().decode(
-                StatisticEvent("on_servers_removed", server_ids=["s0"]), ""
-            )
-            is None
-        )
+        assert InflightDecoder().decode(StatisticEvent("on_servers_removed", server_ids=["s0"]), "") is None
 
     def test_non_event_payload_returns_none(self):
         assert InflightDecoder().decode(b"bytes", "") is None
@@ -179,7 +166,7 @@ class TestCallbackTransport:
 
     def test_stop_is_idempotent(self):
         transport = CallbackTransport(_FakeBalancer())
-        transport.subscribe  # not yet subscribed
+        _ = transport.subscribe  # method exists; not yet subscribed
         transport.stop()  # must not raise even with empty registry
 
 

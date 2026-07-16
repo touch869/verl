@@ -24,6 +24,7 @@ import os
 from typing import Any, Optional, Protocol, runtime_checkable
 
 import ray
+from omegaconf import OmegaConf
 
 from verl.workers.config import RolloutConfig
 
@@ -35,35 +36,30 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # Protocol
 # ---------------------------------------------------------------------------
 
+
 @runtime_checkable
 class RequestLoadBalancer(Protocol):
     """Protocol for rollout inference load balancers (structural subtyping)."""
 
-    def __init__(self, servers: dict[str, Any], config: Optional[dict] = None) -> None:
-        ...
+    def __init__(self, servers: dict[str, Any], config: Optional[dict] = None) -> None: ...
 
-    def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> tuple[str, Any]:
-        ...
+    def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> tuple[str, Any]: ...
 
-    def release_server(self, server_id: str) -> None:
-        ...
+    def release_server(self, server_id: str) -> None: ...
 
-    def add_servers(self, servers: dict[str, Any]) -> None:
-        ...
+    def add_servers(self, servers: dict[str, Any]) -> None: ...
 
-    def remove_servers(self, server_ids: list[str]) -> None:
-        ...
+    def remove_servers(self, server_ids: list[str]) -> None: ...
 
-    def get_all_servers(self) -> list[str]:
-        ...
+    def get_all_servers(self) -> list[str]: ...
 
-    def get_status(self) -> dict:
-        ...
+    def get_status(self) -> dict: ...
 
 
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+
 
 class LoadBalancerRegistry:
     """Registry for load-balancer strategy classes.
@@ -89,25 +85,21 @@ class LoadBalancerRegistry:
             class KVCAwareBalancer:
                 ...
         """
+
         def decorator(balancer_cls):
             if name in cls._registry:
-                raise ValueError(
-                    f"Load balancer '{name}' is already registered. "
-                    f"Existing: {cls._registry[name]}"
-                )
+                raise ValueError(f"Load balancer '{name}' is already registered. Existing: {cls._registry[name]}")
             cls._registry[name] = balancer_cls
             logger.info("Registered load balancer strategy: %s", name)
             return balancer_cls
+
         return decorator
 
     @classmethod
     def get_cls(cls, name: str) -> type:
         """Look up a registered balancer class by name."""
         if name not in cls._registry:
-            raise ValueError(
-                f"Unknown load balancer strategy: '{name}'. "
-                f"Available strategies: {cls.list_strategies()}"
-            )
+            raise ValueError(f"Unknown load balancer strategy: '{name}'. Available strategies: {cls.list_strategies()}")
         return cls._registry[name]
 
     @classmethod
@@ -125,6 +117,7 @@ def _is_ray_actor_class(cls: type) -> bool:
 # Dispatch
 # ---------------------------------------------------------------------------
 
+
 def _resolve_router_strategy(rollout_config: RolloutConfig) -> str:
     """Return the ``router_strategy`` field, defaulting to ``global_sticky_inflight``."""
     return rollout_config.get("router_strategy", "global_sticky_inflight")
@@ -134,7 +127,11 @@ def get_router_handle(servers: dict[str, Any], rollout_config: RolloutConfig) ->
     """Create a load balancer instance from router configuration."""
     strategy = _resolve_router_strategy(rollout_config)
     cls = LoadBalancerRegistry.get_cls(strategy)
-    config = rollout_config.get("router_config", None) or {}
+    # Materialize the router_config node into a plain dict before mutating it:
+    # Hydra-composed nodes are struct-mode, so adding ``full_determinism`` raises
+    # ConfigKeyError. from_config accepts a plain dict either way.
+    router_cfg = rollout_config.get("router_config", None) or {}
+    config = OmegaConf.to_container(OmegaConf.create(router_cfg), resolve=True)
     config["full_determinism"] = getattr(rollout_config, "full_determinism", False)
 
     if _is_ray_actor_class(cls):

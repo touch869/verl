@@ -12,17 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Centralised logging for the llm_router package.
+"""Centralised loguru logging for the kvcaware router.
 
-All llm_router components run inside a Ray actor process where no root
-logger handler is pre-configured — INFO-level messages would be swallowed.
-This module ensures loguru has a stdout sink so routing decisions reach
-Ray's captured log stream, and provides ``get_router_logger()`` for
-per-component bound loggers.
-
-The project standard is loguru (``uni_agent.async_logging``). This module
-replaces the copy-pasted ``logging.StreamHandler`` blocks that were
-duplicated across 4 llm_router files.
+Router components run inside a Ray actor process with no pre-configured root
+handler — INFO messages would be swallowed. This module ensures loguru has a
+stdout sink (so routing decisions reach Ray's captured log stream) and exposes
+``get_router_logger()`` for per-component bound loggers.
 """
 
 from __future__ import annotations

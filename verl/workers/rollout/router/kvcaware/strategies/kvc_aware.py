@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING
 
 from ..config.strategy import KVCAwareStrategyConfig
 from ..logging import get_router_logger
-from .registry import StrategyRegistry
 from ..types import Layer, MetricKey
+from .registry import StrategyRegistry
 
 if TYPE_CHECKING:
     from ..store import DataStore

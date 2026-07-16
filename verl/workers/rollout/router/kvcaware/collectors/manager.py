@@ -12,19 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CollectorManager — lifecycle manager for data collectors.
+"""CollectorManager — constructs and runs data collectors.
 
-Strategies no longer query metrics through the manager — they read from the
-unified ``DataStore`` (which wraps the singleton ``MetricsStore`` /
-``KVCacheStore``). The manager now owns only collector construction and
-lifecycle (start/stop); metric-query proxies that used to live here have moved
-to ``DataStore`` (see ``DataStore.kv_cache_load``).
+Owns collector construction and lifecycle (start/stop). Strategies read metrics
+from ``DataStore`` (the unified facade over ``MetricsStore`` / ``KVCacheStore``),
+not from the manager.
 """
 
 from __future__ import annotations
 
-from .collector import Collector, get_collector
 from ..config.collector import CollectorConfig
+from .collector import Collector, get_collector
 
 
 class CollectorManager:

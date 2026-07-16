@@ -12,32 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""StickySessionStore — per-request ``request_id → replica_id`` LRU store.
+"""StickySessionStore — per-request ``request_id → replica_id`` LRU table.
 
-Owns the sticky-session affinity table for the KVCAware router. The physical
-LRU used to live in ``strategies/sticky_session.py::StickySessionTable`` and
-was held by the Balancer — that was a layering leak (the Balancer docstring
-claims to be a pure framework shell with no routing algorithm). State
-ownership is sunk here: strategies read bindings through ``DataStore`` (the
-facade), and the ``StickyDecoder`` (fed by the Balancer's ``on_acquire`` /
-``on_servers_removed`` callbacks) writes bindings here via ``StickyUpdate``.
+Strategies read bindings through ``DataStore`` (the facade); the ``StickyDecoder``
+(wired via the Balancer's ``on_acquire`` / ``on_servers_removed`` callbacks)
+writes them. Backed by ``cachetools.LRUCache`` — ``get`` refreshes recency, so a
+hot conversation is never evicted for a cold one. The Balancer is a single Ray
+actor running ``acquire_server`` serially, so no locking is needed.
 
-Design notes:
-- **LRU eviction**: backed by ``cachetools.LRUCache`` (same dep verl's
-  ``GlobalRequestLoadBalancer`` uses). Access (``get``) refreshes recency, so a
-  hot conversation is never evicted in favour of a cold one.
-- **No locking**: the ``KVCAwareBalancer`` is a single Ray actor running
-  ``acquire_server`` serially, so the table is touched from one thread.
-  Cross-thread callers must wrap it themselves.
-- **Replica removal**: ``invalidate_replica`` bulk-clears every request_id
-  bound to a removed replica, so stale stickiness never routes to a dead
-  server. O(n) in table size; ``remove_servers`` is a rare elastic event.
-- **Singleton**: ``singleton()`` returns the shared instance, fixed at
-  ``DEFAULT_STICKY_MAX_SIZE`` (mirrors verl ``DEFAULT_ROUTING_CACHE_SIZE`` — a
-  code constant, NOT configurable). Tests that need a different capacity
-  construct a plain instance (``StickySessionStore(max_size=...)``) directly.
-
-Reference: verl ``router.py`` ``DEFAULT_ROUTING_CACHE_SIZE = 10000``.
+``singleton()`` returns the shared instance at ``DEFAULT_STICKY_MAX_SIZE`` (a
+code constant, not configurable); tests that need a different capacity construct
+``StickySessionStore(max_size=...)`` directly.
 """
 
 from __future__ import annotations

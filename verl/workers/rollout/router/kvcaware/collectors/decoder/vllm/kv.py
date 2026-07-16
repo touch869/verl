@@ -24,8 +24,8 @@ import msgpack
 
 from ....collectors.decoder import Decoder, KVCacheUpdate
 from ....collectors.decoder.vllm.kv_event import KVCacheEvent
-from ....types import Layer
 from ....logging import get_router_logger
+from ....types import Layer
 from ....utils.hash import compute_hash
 
 logger = get_router_logger("vllm-kv")
@@ -74,7 +74,7 @@ class VLLMKVDecoder(Decoder):
             raw = msgpack.unpackb(raw_data, raw=False)
 
             if not isinstance(raw, list) or len(raw) == 0:
-                logger.warning("Unexpected msgpack format from node %s", node_id)
+                logger.warning("Unexpected msgpack format from node {node_id}")
                 return None
             event_payloads = raw if isinstance(raw[0], list) else [raw]
 
@@ -92,12 +92,8 @@ class VLLMKVDecoder(Decoder):
                         raise ValueError(f"Unknow event.event_type {event.event_type}.")
             return update
 
-        except (msgpack.UnpackException, ValueError, TypeError) as exc:
-            logger.warning(
-                "Failed to decode msgpack payload from node %s: %s",
-                node_id,
-                exc,
-            )
+        except (msgpack.UnpackException, ValueError, TypeError):
+            logger.warning("Failed to decode msgpack payload from node {node_id}: {exc}")
             return None
 
     @classmethod
