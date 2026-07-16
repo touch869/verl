@@ -18,12 +18,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from .kv_cache_store import KVCacheStore
+from .metrics_store import MetricsStore
+from .sticky_session_store import StickySessionStore
 from ..types import Layer, MetricKey
-
-# The three singleton sub-stores (KVCacheStore / MetricsStore /
-# StickySessionStore) are concrete implementations that land in a later
-# commit. Their imports are restored there; this module imports cleanly
-# in the meantime (DataStore construction is exercised once they exist).
 
 
 class DataStore:
