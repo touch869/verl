@@ -34,8 +34,8 @@ from conftest import NODE_ID, VLLM_MODEL, ZMQ_REPLAY_PORT, ZMQ_SUB_PORT, send_in
 
 from verl.workers.rollout.router.kvcaware.collectors.manager import CollectorManager
 from verl.workers.rollout.router.kvcaware.config.collector import CollectorConfig
-from verl.workers.rollout.router.kvcaware.types import Layer
 from verl.workers.rollout.router.kvcaware.store.data_store import DataStore
+from verl.workers.rollout.router.kvcaware.types import Layer
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 

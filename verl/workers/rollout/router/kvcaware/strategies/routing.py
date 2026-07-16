@@ -15,8 +15,7 @@
 """route() — weighted replica ranking for the KVCAware router.
 
 The Balancer delegates each request to ``route(strategies, prompt_ids,
-provider, replicas)`` and maps ``ranking[0]`` back to a server handle
-(detailed_balancer.md §2.3).
+provider, replicas)`` and maps ``ranking[0]`` back to a server handle.
 """
 
 from __future__ import annotations

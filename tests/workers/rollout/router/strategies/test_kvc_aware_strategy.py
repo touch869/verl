@@ -31,17 +31,15 @@ from __future__ import annotations
 import pytest
 
 from verl.workers.rollout.router.kvcaware.strategies import route
-from verl.workers.rollout.router.kvcaware.strategies.kvc_aware import (
-    KVCacheAwareStrategy,
-    StrategyError,
-)
-from verl.workers.rollout.router.kvcaware.strategies.routing import RoutingStrategy
 from verl.workers.rollout.router.kvcaware.strategies.base import ReplicaInfo
 from verl.workers.rollout.router.kvcaware.strategies.kvc_aware import (
     DEFAULT_LOAD_WEIGHTS,
     STICKY_TOP_SCORE,
+    KVCacheAwareStrategy,
+    StrategyError,
     load_normalized,
 )
+from verl.workers.rollout.router.kvcaware.strategies.routing import RoutingStrategy
 from verl.workers.rollout.router.kvcaware.types import Layer, MetricKey
 
 pytestmark = [pytest.mark.ut, pytest.mark.cpu]

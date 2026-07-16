@@ -74,8 +74,7 @@ class KVCacheStore:
 
     # ── Block management ────────────────────────────────────────────────
 
-    def add_blocks(self, replica_id: str, block_hashes: Iterable[str],
-                    layer: Layer = Layer.GPU) -> None:
+    def add_blocks(self, replica_id: str, block_hashes: Iterable[str], layer: Layer = Layer.GPU) -> None:
         """Add blocks to a replica at a layer, updating the reverse index.
 
         Only GPU blocks are indexed in ``replicas_by_block`` (they drive
@@ -91,8 +90,7 @@ class KVCacheStore:
                     self.replicas_by_block[bh] = set()
                 self.replicas_by_block[bh].add(replica_id)
 
-    def remove_blocks(self, replica_id: str, block_hashes: Iterable[str],
-                      layer: Layer = Layer.GPU) -> None:
+    def remove_blocks(self, replica_id: str, block_hashes: Iterable[str], layer: Layer = Layer.GPU) -> None:
         """Remove blocks from a replica at a layer, updating the reverse index."""
         with self._lock:
             layer_counts = self._replica_layer_counts.setdefault(layer, {})
@@ -119,8 +117,7 @@ class KVCacheStore:
 
     # ── Prefix hit rate queries ─────────────────────────────────────────
 
-    def get_layer_prefix_hit_rate(self, node_id: str, prompt_ids: list[int],
-                                   layer: Layer = Layer.GPU) -> float:
+    def get_layer_prefix_hit_rate(self, node_id: str, prompt_ids: list[int], layer: Layer = Layer.GPU) -> float:
         """Prefix-cache hit rate for a node at a layer, ∈ [0.0, 1.0].
 
         GPU: walk the local reverse index (``replicas_by_block``) along the

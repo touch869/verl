@@ -22,8 +22,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .base import ConfigError, StrategyConfig, _multiline_repr
 from ..types import Layer
+from .base import ConfigError, StrategyConfig, _multiline_repr
 
 
 @dataclass(repr=False)
@@ -35,9 +35,7 @@ class KVCAwareStrategyConfig(StrategyConfig):
 
     alpha: float = 0.7
     load_threshold: float = 0.9
-    layer_weights: dict[Layer, float] = field(
-        default_factory=lambda: {Layer.GPU: 0.7, Layer.CPU: 0.2, Layer.SSD: 0.1}
-    )
+    layer_weights: dict[Layer, float] = field(default_factory=lambda: {Layer.GPU: 0.7, Layer.CPU: 0.2, Layer.SSD: 0.1})
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -46,8 +44,8 @@ class KVCAwareStrategyConfig(StrategyConfig):
         # Normalize yaml str keys → Layer (also validates each key is a known layer).
         try:
             self.layer_weights = {Layer(k): v for k, v in self.layer_weights.items()}
-        except ValueError:
-            raise ConfigError(f"layer_weights keys must be layer names, got {set(self.layer_weights)}")
+        except ValueError as exc:
+            raise ConfigError(f"layer_weights keys must be layer names, got {set(self.layer_weights)}") from exc
         if set(self.layer_weights.keys()) != {Layer.GPU, Layer.CPU, Layer.SSD}:
             raise ConfigError(
                 f"layer_weights must be exactly {{{Layer.GPU}, {Layer.CPU}, {Layer.SSD}}}, "

@@ -75,12 +75,9 @@ class KVCAwareConfig:
         cfg = OmegaConf.create(cfg)
 
         # ── Extract polymorphic sections before merge ──────────────
-        # NOTE: VeRL passes a plain dict (from hydra.compose → to_container) that
-        # also carries `router_class` (Balancer FQN for VeRL's importlib lookup).
-        # `router_class` is VeRL-side metadata, NOT part of the config domain —
-        # from_config only extracts strategies/collector/cache_store below, so
-        # it is silently ignored. Top-level `_target_` is defensively popped too
-        # (legacy/structured-input compatibility); the current YAML has none.
+        # Strategies are polymorphic (_target_); pull them out before the
+        # dataclass-typed merge below. Top-level `_target_` is defensively popped
+        # for structured-input compatibility.
         strategies_raw = _extract_strategies(cfg)
 
         # ── Step 1: merge dataclass-typed fields (collector, cache_store) ──

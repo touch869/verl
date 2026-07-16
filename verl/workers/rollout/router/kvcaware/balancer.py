@@ -12,16 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""KVCAwareBalancer — top-level orchestration shell for the KVCAware router.
+"""KVCAwareBalancer — orchestration shell for the KV-cache-aware router.
 
-A **pure framework shell** (detailed_balancer.md §1): it wires Config /
-Strategy / collectors, manages their lifecycle, and delegates each request to
-``route()``. It contains no routing algorithm.
-
-VeRL imports this class by FQN (``router_class``) and wraps it with
-``ray.remote(...)`` at runtime, so this is a plain class — directly
-constructible and unit-testable. It satisfies the ``RequestLoadBalancer``
-Protocol (6 methods) via structural subtyping.
+A pure framework shell: it wires Config / Strategy / collectors, manages their
+lifecycle, and delegates each request to ``route()``. It contains no routing
+algorithm. Registered in ``LoadBalancerRegistry`` under "kvcaware" and
+instantiated by ``get_router_handle``; a plain class, directly constructible
+and unit-testable, satisfying the ``RequestLoadBalancer`` Protocol.
 """
 
 from __future__ import annotations
@@ -30,6 +27,7 @@ from typing import Any, Callable, Optional
 
 import ray
 
+from ..base import LoadBalancerRegistry
 from .collectors import CollectorManager
 from .config import KVCAwareConfig
 from .logging import get_router_logger
@@ -39,7 +37,6 @@ from .strategies import (
     StrategyRegistry,
     route,
 )
-from ..base import LoadBalancerRegistry
 
 logger = get_router_logger("balancer")
 
@@ -62,15 +59,11 @@ class KVCAwareBalancer:
                 strategy.set_capacity(max_num_seqs)
         logger.info(f"KVCAwareBalancer: max_num_seqs={max_num_seqs}")
         self._route_calls = 0
-        # Before _init_manager: CallbackTransport subscribes during manager.start().
         self._callbacks: dict[str, list[Callable]] = {
             "on_acquire": [],
             "on_release": [],
             "on_servers_removed": [],
         }
-        # _store before _init_manager: real env's _init_manager only wires the
-        # collector manager, but tests inject a fake store via _init_manager, so
-        # the real DataStore must be constructed first (and thus overridable).
         self._store = DataStore()
         self._init_manager()
 
@@ -91,18 +84,11 @@ class KVCAwareBalancer:
         return default
 
     def _init_manager(self) -> None:
-        """Resolve per-server endpoints from Ray actor handles and init the manager.
+        """Resolve per-server endpoints from Ray actor handles, then start collectors.
 
-        Iterates ``self._servers``, calling ``get_server_address.remote()`` and
-        ``get_kv_events_endpoints.remote()`` on each handle to dynamically
-        discover the Prometheus polling addresses and ZMQ kv-event endpoints.
-        The resolved addresses are then passed to ``CollectorManager``, which
-        routes them to the appropriate collector type at creation time.
-
-        Handles that are not real Ray actors (e.g. plain strings passed by
-        unit tests or bring-up stubs) have no ``get_server_address`` remote;
-        for those, dynamic discovery is skipped and collectors fall back to
-        their configured/default endpoints.
+        Non-actor handles (plain strings in unit tests) have no
+        ``get_server_address``; discovery is skipped and collectors fall back
+        to configured/default endpoints.
         """
         collection_names = sorted({name for cfg in self._config.strategies for name in cfg.collector_names})
         server_addresses: dict[str, str] = {}
@@ -128,8 +114,7 @@ class KVCAwareBalancer:
                 server_addresses[replica_id] = f"{ip}:{port}"
                 if endpoints is None:
                     continue
-                # verl returns [sub_addr, replay_addr]; ZMQTransport needs
-                # [sub, replay, publisher, topic] — pad the trailing pair.
+                # Pad verl's [sub, replay] to the [sub, replay, publisher, topic] ZMQTransport expects.
                 if len(endpoints) == 2:
                     endpoints = [*endpoints, "zmq", "kv-events"]
                 kv_event_endpoints[replica_id] = endpoints
@@ -158,11 +143,7 @@ class KVCAwareBalancer:
             lst.remove(fn)
 
     def _fire(self, event: str, *args: Any) -> None:
-        """Invoke every registered callback for ``event`` (errors swallowed).
-
-        A buggy statistic collector must not break the request path or other
-        callbacks, so each callback is isolated.
-        """
+        """Invoke every registered callback for ``event``; errors are swallowed."""
         for fn in self._callbacks.get(event, []):
             try:
                 fn(*args)
@@ -174,12 +155,7 @@ class KVCAwareBalancer:
         return list(self._servers.keys())
 
     def get_status(self) -> dict:
-        """Return construction + routing state for debugging.
-
-        Reports what the balancer was wired with (pool, manager type,
-        materialized strategies) and how many routing decisions it has made —
-        enough to verify the construction flow over the remote boundary.
-        """
+        """Construction + routing snapshot for debugging."""
         return {
             "servers": list(self._servers.keys()),
             "manager": type(self._manager).__name__,
@@ -189,26 +165,15 @@ class KVCAwareBalancer:
         }
 
     def release_server(self, server_id: str) -> None:
-        """Release a server after a request completes.
-
-        Fires ``on_release`` so the InflightDecoder decrements the in-flight
-        counter (mirrors verl ``GlobalRequestLoadBalancer``'s release -1). The
-        sticky binding is untouched here — it persists across turns.
-        """
+        """Release a server after a request completes; fires ``on_release``."""
         self._fire("on_release", server_id)
 
     def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> tuple[str, Any]:
-        """Acquire the best server for a request: delegate to ``route()``, map back.
+        """Delegate to ``route()`` for a best-first ranking, return ``(top, handle)``.
 
-        Builds ``ReplicaInfo`` candidates from the pool, asks ``route()`` for a
-        best-first ranking, and returns ``(ranking[0], handle)``. Raises
-        ``RuntimeError`` if no replica is available (empty pool or all blacklisted).
-
-        ``request_id`` is forwarded to ``route()`` so strategies can short-circuit
-        to a bound, non-overloaded replica (read via ``store.get_sticky_binding``).
-        After a ranking is chosen, ``on_acquire`` fires so the sticky binding is
-        refreshed and the in-flight counter bumps — the next turn of the same
-        ``request_id`` stays affinity-bound (or rebinds when routing fell back).
+        Raises ``RuntimeError`` if no replica is available. ``request_id`` is
+        forwarded so strategies can short-circuit to a sticky-bound replica;
+        ``on_acquire`` then refreshes the binding.
         """
         replicas = [ReplicaInfo(replica_id=sid) for sid in self._servers]
         self._route_calls += 1
@@ -222,7 +187,6 @@ class KVCAwareBalancer:
         if not ranking:
             raise RuntimeError("no available replica to route to")
         server_id = ranking[0]
-        # After route() picks the winner — strategy.score() runs before the sort.
         self._fire("on_acquire", request_id, server_id)
         logger.info(
             f"request={request_id} routed to server={server_id} (ranking={ranking}, pool={list(self._servers)})",
@@ -230,24 +194,12 @@ class KVCAwareBalancer:
         return server_id, self._servers[server_id]
 
     def add_servers(self, servers: dict[str, Any]) -> None:
-        """Bulk-add servers to the pool.
-
-        Note: the manager is keyed by the endpoint addresses resolved at
-        init time, not by this pool, so it is not touched here.
-        """
+        """Bulk-add servers to the pool (manager is keyed by init-time addresses, untouched here)."""
         for sid, handle in servers.items():
             self._servers[sid] = handle
 
     def remove_servers(self, server_ids: list[str]) -> None:
-        """Bulk-remove servers from the pool (manager is not keyed by the pool).
-
-        Fires ``on_servers_removed`` so the sticky-session store invalidates
-        every binding pointing at a removed server — a subsequent
-        ``acquire_server`` for a bound conversation won't short-circuit to a
-        dead replica (the strategy would reject it anyway, but clearing early
-        keeps the table clean and the logs honest). Inflight deliberately
-        ignores removal — release symmetry maintains the counter.
-        """
+        """Bulk-remove servers; fires ``on_servers_removed`` to invalidate sticky bindings."""
         for sid in server_ids:
             self._servers.pop(sid, None)
         if server_ids:

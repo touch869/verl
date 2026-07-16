@@ -12,14 +12,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime strategies (public surface: ``route`` entrypoint + registry)."""
-
-# Import kvc_aware for its side-effect: StrategyRegistry.register(...).
-# Not re-exported — it's an implementation detail, but the registration
-# MUST fire before balancer.__init__ calls StrategyRegistry.get(...).
-from . import kvc_aware  # noqa: F401
-from .base import ReplicaInfo
-from .registry import StrategyRegistry
-from .routing import route
-
-__all__ = ["ReplicaInfo", "StrategyRegistry", "route"]

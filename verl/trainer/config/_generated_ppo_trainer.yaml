@@ -238,6 +238,8 @@ actor_rollout_ref:
     entropy_from_logits_chunk_size: 2048
     entropy_checkpointing: false
   rollout:
+    router_config:
+      max_cache_size: 10000
     _target_: verl.workers.config.RolloutConfig
     name: ???
     mode: async

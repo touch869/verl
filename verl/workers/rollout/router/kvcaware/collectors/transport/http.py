@@ -66,12 +66,12 @@ class HTTPTransport(Transport):
                     if isinstance(resp, Exception):
                         continue  # failed node — handler falls back to defaults
                     if resp.status_code != 200:
-                        logger.warning("Failed to fetch metrics from %s: HTTP %s", nid, resp.status_code)
+                        logger.warning(f"Failed to fetch metrics from {nid}: HTTP {resp.status_code}")
                         continue
                     try:
                         handler(resp.text, nid)
                     except Exception as exc:
-                        logger.debug("Handler error for node %s: %s", nid, exc)
+                        logger.debug(f"Handler error for node {nid}: {exc}")
                 await asyncio.sleep(self._interval)
         except (asyncio.CancelledError, GeneratorExit):
             pass
@@ -82,7 +82,7 @@ class HTTPTransport(Transport):
                     await client.aclose()
                 except Exception as exc:
                     # May fail if called outside an async context (e.g. GC finalizer)
-                    logger.debug("HTTPTransport: aclose failed during cleanup: %s", exc)
+                    logger.debug(f"HTTPTransport: aclose failed during cleanup: {exc}")
 
     def stop(self) -> None:
         """No protocol-level resources to close here.

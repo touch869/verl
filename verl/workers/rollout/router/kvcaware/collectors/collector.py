@@ -17,17 +17,16 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import threading
 from collections import defaultdict
 from concurrent.futures import Future
 
-from .decoder import Decoder, KVCacheUpdate, MetricsUpdate, StickyUpdate
-from .transport.base import Transport
 from ..config.collector import CollectorConfig
 from ..logging import get_router_logger
-from ..types import MetricKey
 from ..store.data_store import DataStore
+from ..types import MetricKey
+from .decoder import Decoder, KVCacheUpdate, MetricsUpdate, StickyUpdate
+from .transport.base import Transport
 
 logger = get_router_logger("collector")
 
@@ -118,7 +117,7 @@ class Collector:
             else:
                 # None is normal for statistic decoders that skip an event
                 # (e.g. StickyDecoder on_release); demote to debug to avoid per-turn noise.
-                logger.debug("decoder.decode returned no update: %r", result)
+                logger.debug(f"decoder.decode returned no update: {result}")
 
         if getattr(self._transport, "is_async", True):
             self._loop_thread = threading.Thread(
@@ -296,7 +295,7 @@ class Collector:
             try:
                 drain.result(timeout=15)
             except Exception as exc:
-                logger.debug("Error draining tasks on stop: %s", exc)
+                logger.debug(f"Error draining tasks on stop: {exc}")
 
             self._loop.call_soon_threadsafe(self._loop.stop)
 
@@ -372,6 +371,5 @@ def get_collector(
         return Collector(CallbackTransport(balancer_handler), InflightDecoder())
 
     raise ValueError(
-        f"Unknown collector: '{name}'. "
-        "Available: ['vllm_metrics', 'vllm_zmq', 'sticky_stat', 'inflight_stat']"
+        f"Unknown collector: '{name}'. Available: ['vllm_metrics', 'vllm_zmq', 'sticky_stat', 'inflight_stat']"
     )

@@ -18,10 +18,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..types import Layer, MetricKey
 from .kv_cache_store import KVCacheStore
 from .metrics_store import MetricsStore
 from .sticky_session_store import StickySessionStore
-from ..types import Layer, MetricKey
 
 
 class DataStore:

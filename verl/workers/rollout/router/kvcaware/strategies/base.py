@@ -23,8 +23,7 @@ from dataclasses import dataclass
 class ReplicaInfo:
     """Descriptor of a routable replica.
 
-    Carries only the replica id — the actor handle never leaves the Balancer's
-    ``_servers`` dict (detailed_balancer.md §2.3).
+    Carries only the replica id; the actor handle stays in the Balancer's pool.
     """
 
     replica_id: str

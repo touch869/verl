@@ -18,5 +18,7 @@ from .base import RequestLoadBalancer, get_router_handle
 __all__ = ["get_router_handle", "RequestLoadBalancer"]
 
 # Trigger strategy registration (decorator side-effects at import time)
-from . import global_balancer  # noqa: E402, F401
-from . import kvcaware         # noqa: E402, F401
+from . import (
+    global_balancer,  # noqa: E402, F401
+    kvcaware,  # noqa: E402, F401
+)

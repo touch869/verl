@@ -30,8 +30,8 @@ from conftest import NODE_ID
 
 from verl.workers.rollout.router.kvcaware.collectors.collector import get_collector
 from verl.workers.rollout.router.kvcaware.config.collector import CollectorConfig
-from verl.workers.rollout.router.kvcaware.types import MetricKey
 from verl.workers.rollout.router.kvcaware.store.data_store import DataStore
+from verl.workers.rollout.router.kvcaware.types import MetricKey
 
 POLL_INTERVAL = 2.0
 HTTP_TIMEOUT = 10.0

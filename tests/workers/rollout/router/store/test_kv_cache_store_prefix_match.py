@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import pytest
 
-from verl.workers.rollout.router.kvcaware.types import Layer
 from verl.workers.rollout.router.kvcaware.store.kv_cache_store import KVCacheStore
+from verl.workers.rollout.router.kvcaware.types import Layer
 from verl.workers.rollout.router.kvcaware.utils.hash import get_prefix_hashes
 
 pytestmark = [pytest.mark.ut, pytest.mark.cpu]
@@ -81,8 +81,8 @@ def test_max_contiguous_match_per_replica() -> None:
     store.add_blocks("rep_b", [h1, h2])
     store.add_blocks("rep_c", [h1, h2, h3])
 
-    assert store.get_layer_prefix_hit_rate("rep_a", prompt, Layer.GPU) == 1.0   # 4/4
-    assert store.get_layer_prefix_hit_rate("rep_b", prompt, Layer.GPU) == 0.5   # 2/4
+    assert store.get_layer_prefix_hit_rate("rep_a", prompt, Layer.GPU) == 1.0  # 4/4
+    assert store.get_layer_prefix_hit_rate("rep_b", prompt, Layer.GPU) == 0.5  # 2/4
     assert store.get_layer_prefix_hit_rate("rep_c", prompt, Layer.GPU) == 0.75  # 3/4
 
 
