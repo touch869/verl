@@ -11,12 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""verl rollout router — registry, protocol, and dispatch."""
 
-from .base import RequestLoadBalancer, get_router_handle
+"""Shared types, imported by many internal modules."""
 
-__all__ = ["get_router_handle", "RequestLoadBalancer"]
+from .layer import Layer
+from .metric_spec import METRIC_SPECS, MetricKey
 
-# Trigger strategy registration (decorator side-effects at import time)
-from . import global_balancer  # noqa: E402, F401
-from . import kvcaware         # noqa: E402, F401
+__all__ = ["Layer", "MetricKey", "METRIC_SPECS"]

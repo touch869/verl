@@ -11,12 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""verl rollout router — registry, protocol, and dispatch."""
 
-from .base import RequestLoadBalancer, get_router_handle
+"""KVCAware config types."""
 
-__all__ = ["get_router_handle", "RequestLoadBalancer"]
+from .base import ConfigError, StrategyConfig
+from .cache import CacheStoreConfig
+from .collector import CollectorConfig
+from .router import KVCAwareConfig
+from .strategy import KVCAwareStrategyConfig
 
-# Trigger strategy registration (decorator side-effects at import time)
-from . import global_balancer  # noqa: E402, F401
-from . import kvcaware         # noqa: E402, F401
+__all__ = [
+    "CacheStoreConfig",
+    "CollectorConfig",
+    "ConfigError",
+    "KVCAwareConfig",
+    "KVCAwareStrategyConfig",
+    "StrategyConfig",
+]
