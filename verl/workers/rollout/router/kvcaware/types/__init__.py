@@ -16,5 +16,6 @@
 
 from .layer import Layer
 from .metric_spec import METRIC_SPECS, MetricKey
+from .slow_cut import SlowCut
 
-__all__ = ["Layer", "MetricKey", "METRIC_SPECS"]
+__all__ = ["Layer", "MetricKey", "METRIC_SPECS", "SlowCut"]
