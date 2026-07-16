@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Transport layers."""
+"""Basic decoders."""
 
-from .base import Transport
-from .callback import CallbackTransport
-from .http import HTTPTransport
-from .zmq import ZMQTransport
+from .inflight import InflightDecoder
+from .sticky import StickyDecoder
 
-__all__ = ["Transport", "CallbackTransport", "HTTPTransport", "ZMQTransport"]
+__all__ = ["InflightDecoder", "StickyDecoder"]

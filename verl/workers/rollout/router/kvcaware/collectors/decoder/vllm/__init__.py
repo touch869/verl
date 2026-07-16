@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Transport layers."""
+"""vLLM backend decoders."""
 
-from .base import Transport
-from .callback import CallbackTransport
-from .http import HTTPTransport
-from .zmq import ZMQTransport
+from .kv import VLLMKVDecoder
+from .metrics import VLLMMetricsDecoder
 
-__all__ = ["Transport", "CallbackTransport", "HTTPTransport", "ZMQTransport"]
+__all__ = ["VLLMKVDecoder", "VLLMMetricsDecoder"]
