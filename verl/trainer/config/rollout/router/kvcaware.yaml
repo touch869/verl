@@ -11,6 +11,9 @@
 
 strategies:
   - _target_: verl.workers.rollout.router.kvcaware.config.strategy.KVCAwareStrategyConfig
+    memory_overload_filter: True
+    # prefix-load-aware / least-inflight
+    slow_cut: prefix-load-aware
     weight: 1.0
     alpha: 0.3
     # overload when load > threshold (load ∈ [0,1], bigger = more loaded)

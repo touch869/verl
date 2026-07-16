@@ -40,7 +40,7 @@ from verl.workers.rollout.router.kvcaware.strategies.kvc_aware import (
     load_normalized,
 )
 from verl.workers.rollout.router.kvcaware.strategies.routing import RoutingStrategy
-from verl.workers.rollout.router.kvcaware.types import Layer, MetricKey
+from verl.workers.rollout.router.kvcaware.types import Layer, MetricKey, SlowCut
 
 pytestmark = [pytest.mark.ut, pytest.mark.cpu]
 # --------------------------------------------------------------------------- #
@@ -943,16 +943,17 @@ class TestDefaultWeights:
 
 
 # --------------------------------------------------------------------------- #
-# USE_VERL_STICKY env-var mode (verl-default: sticky skips overload + least-inflight)
+# Fallback modes: memory_overload_filter (sticky overload gate) + slow_cut (fallback scoring)
 # --------------------------------------------------------------------------- #
-class TestVerlDefaultMode:
-    """``USE_VERL_STICKY`` flips verl-default mode: sticky hit ignores overload and
-    the fallback becomes least-inflight (mirrors verl GlobalRequestLoadBalancer)."""
+class TestFallbackModes:
+    """The two formerly-coupled ``USE_VERL_STICKY`` behaviors are now independent
+    config knobs: ``memory_overload_filter`` gates the sticky overload check, and
+    ``slow_cut`` selects the fallback scoring (``least-inflight`` mirrors verl
+    GlobalRequestLoadBalancer)."""
 
-    def test_sticky_hit_ignores_overload(self, monkeypatch):
-        """verl: bound replica wins even when saturated (no overload check)."""
-        monkeypatch.setenv("USE_VERL_STICKY", "1")
-        strat = _strat(load_threshold=0.9)
+    def test_sticky_hit_ignores_overload(self):
+        """memory_overload_filter=False: bound replica wins even when saturated."""
+        strat = _strat(load_threshold=0.9, memory_overload_filter=False)
         provider = FakeRouteDataProvider(
             {
                 "rep_a": {"kv_cache_usage_perc": 1.0, "num_requests_running": 64, "num_requests_waiting": 1000},
@@ -963,20 +964,18 @@ class TestVerlDefaultMode:
         ranking = route([(strat, 1.0)], PROMPT_IDS, provider, _replicas("rep_a", "rep_b"), "r1")
         assert ranking[0] == "rep_a"  # sticky wins despite load≈1.0
 
-    def test_miss_routes_to_least_inflight(self, monkeypatch):
-        """verl fallback: pick the replica with the fewest in-flight requests."""
-        monkeypatch.setenv("USE_VERL_STICKY", "1")
-        strat = _strat()
+    def test_miss_routes_to_least_inflight(self):
+        """slow_cut=least-inflight: pick the replica with the fewest in-flight requests."""
+        strat = _strat(slow_cut=SlowCut.LEAST_INFLIGHT)
         provider = FakeRouteDataProvider(
             {"rep_a": {"inflight_count": 5}, "rep_b": {"inflight_count": 2}},
         )
         ranking = route([(strat, 1.0)], PROMPT_IDS, provider, _replicas("rep_a", "rep_b"), "r1")
         assert ranking[0] == "rep_b"
 
-    def test_stale_binding_falls_back_to_least_inflight(self, monkeypatch):
-        """verl: bound replica no longer in pool → least-inflight fallback."""
-        monkeypatch.setenv("USE_VERL_STICKY", "1")
-        strat = _strat()
+    def test_stale_binding_falls_back_to_least_inflight(self):
+        """slow_cut=least-inflight: bound replica no longer in pool → fallback."""
+        strat = _strat(slow_cut=SlowCut.LEAST_INFLIGHT)
         provider = FakeRouteDataProvider(
             {"rep_a": {"inflight_count": 5}, "rep_b": {"inflight_count": 1}},
             sticky={"r1": "rep_gone"},
@@ -984,10 +983,9 @@ class TestVerlDefaultMode:
         ranking = route([(strat, 1.0)], PROMPT_IDS, provider, _replicas("rep_a", "rep_b"), "r1")
         assert ranking[0] == "rep_b"
 
-    def test_inflight_tie_keeps_pool_order(self, monkeypatch):
-        """verl tie-break: equal inflight → first replica in pool order."""
-        monkeypatch.setenv("USE_VERL_STICKY", "1")
-        strat = _strat()
+    def test_inflight_tie_keeps_pool_order(self):
+        """slow_cut=least-inflight tie-break: equal inflight → first replica in pool order."""
+        strat = _strat(slow_cut=SlowCut.LEAST_INFLIGHT)
         provider = FakeRouteDataProvider(
             {"rep_a": {"inflight_count": 3}, "rep_b": {"inflight_count": 3}},
         )

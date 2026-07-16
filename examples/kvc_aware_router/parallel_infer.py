@@ -105,6 +105,19 @@ def init_config(args: argparse.Namespace) -> DictConfig:
         }
     rollout.engine_kwargs = {"vllm": vllm_kwargs}
 
+    # Optional KVCAware router strategy[0] overrides — each falls back to the
+    # kvcaware.yaml value when the flag is omitted. The override above composes
+    # router_config, so strategies is a non-empty list.
+    strat0 = rollout.router_config.strategies[0]
+    if args.alpha is not None:
+        strat0.alpha = args.alpha
+    if args.load_threshold is not None:
+        strat0.load_threshold = args.load_threshold
+    if args.memory_overload_filter is not None:
+        strat0.memory_overload_filter = args.memory_overload_filter
+    if args.slow_cut is not None:
+        strat0.slow_cut = args.slow_cut
+
     return config
 
 
@@ -278,6 +291,35 @@ def main():
         action="store_true",
         help="Enable vLLM kv-events zmq publisher for retained-cache occupancy collection. "
         "Required for KVCAware router load signal and standalone collector metrics.",
+    )
+
+    # KVCAware router strategy[0] overrides (each falls back to kvcaware.yaml when omitted).
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="KVCAware strategy[0] α (cache vs load blend, [0,1]). Overrides kvcaware.yaml when set.",
+    )
+    parser.add_argument(
+        "--load-threshold",
+        type=float,
+        default=None,
+        help="KVCAware strategy[0] load_threshold (overload when load > threshold, (0,1)). "
+        "Overrides kvcaware.yaml when set.",
+    )
+    parser.add_argument(
+        "--memory-overload-filter",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="KVCAware strategy[0] memory_overload_filter — gate the sticky short-circuit on overload. "
+        "Use --memory-overload-filter / --no-memory-overload-filter; omit to keep the kvcaware.yaml default.",
+    )
+    parser.add_argument(
+        "--slow-cut",
+        type=str,
+        choices=["prefix-load-aware", "least-inflight"],
+        default=None,
+        help="KVCAware strategy[0] slow_cut fallback scoring mode. Overrides kvcaware.yaml when set.",
     )
 
     args = parser.parse_args()

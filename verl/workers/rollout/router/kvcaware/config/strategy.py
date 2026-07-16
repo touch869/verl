@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..types import Layer
+from ..types import Layer, SlowCut
 from .base import ConfigError, StrategyConfig, _multiline_repr
 
 
@@ -36,11 +36,23 @@ class KVCAwareStrategyConfig(StrategyConfig):
     alpha: float = 0.7
     load_threshold: float = 0.9
     layer_weights: dict[Layer, float] = field(default_factory=lambda: {Layer.GPU: 0.7, Layer.CPU: 0.2, Layer.SSD: 0.1})
+    # Sticky short-circuit: when True, a returning session is sent back to its
+    # bound replica only if that replica is NOT overloaded (load > load_threshold).
+    memory_overload_filter: bool = True
+    # Fallback scoring mode used after the sticky short-circuit misses.
+    slow_cut: SlowCut = SlowCut.PREFIX_LOAD_AWARE
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if not 0 < self.load_threshold < 1:
             raise ConfigError(f"load_threshold must be in (0, 1), got {self.load_threshold}")
+        if not isinstance(self.memory_overload_filter, bool):
+            raise ConfigError(f"memory_overload_filter must be a bool, got {self.memory_overload_filter!r}")
+        # Normalize yaml str → SlowCut (also validates the value is a known mode).
+        try:
+            self.slow_cut = SlowCut(self.slow_cut)
+        except ValueError as exc:
+            raise ConfigError(f"slow_cut must be one of {[m.value for m in SlowCut]}, got {self.slow_cut!r}") from exc
         # Normalize yaml str keys → Layer (also validates each key is a known layer).
         try:
             self.layer_weights = {Layer(k): v for k, v in self.layer_weights.items()}

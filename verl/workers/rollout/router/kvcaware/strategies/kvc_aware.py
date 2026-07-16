@@ -16,12 +16,11 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 from ..config.strategy import KVCAwareStrategyConfig
 from ..logging import get_router_logger
-from ..types import Layer, MetricKey
+from ..types import Layer, MetricKey, SlowCut
 from .registry import StrategyRegistry
 
 if TYPE_CHECKING:
@@ -65,6 +64,8 @@ class KVCacheAwareStrategy:
         layer_weights: dict[Layer, float],
         collector_names: list[str],
         weight: float,
+        memory_overload_filter: bool = True,
+        slow_cut: SlowCut | str = SlowCut.PREFIX_LOAD_AWARE,
         load_weights: tuple[float, float, float] = DEFAULT_LOAD_WEIGHTS,
     ) -> None:
         if not 0 <= alpha <= 1:
@@ -80,6 +81,12 @@ class KVCacheAwareStrategy:
         weights_sum = sum(layer_weights.values())
         if abs(weights_sum - 1.0) > 1e-6:
             raise StrategyError(f"layer_weights values must sum to 1.0, got {weights_sum}")
+        if not isinstance(memory_overload_filter, bool):
+            raise StrategyError(f"memory_overload_filter must be a bool, got {memory_overload_filter!r}")
+        try:
+            slow_cut = SlowCut(slow_cut)
+        except ValueError as exc:
+            raise StrategyError(f"slow_cut must be one of {[m.value for m in SlowCut]}, got {slow_cut!r}") from exc
         if len(load_weights) != 3 or any(w < 0 for w in load_weights):
             raise StrategyError(f"load_weights must be 3 non-negative values, got {load_weights}")
         if abs(sum(load_weights) - 1.0) > 1e-6:
@@ -90,14 +97,14 @@ class KVCacheAwareStrategy:
         self.layer_weights = dict(layer_weights)
         self.collector_names = collector_names
         self.weight = weight
+        self.memory_overload_filter = memory_overload_filter
+        self.slow_cut = slow_cut
         self.load_weights = tuple(load_weights)
         self._max_num_seqs: int | None = None
-        # USE_VERL_STICKY=1 → verl-default mode (test-only; not a config field).
-        self._use_verl = os.environ.get("USE_VERL_STICKY", "").lower() in ("1", "true", "yes")
         logger.info(
             f"KVCacheAwareStrategy created: alpha={self.alpha:.2f}, "
             f"load_threshold={self.load_threshold:.2f}, load_weights={self.load_weights}, "
-            f"USE_VERL_STICKY={self._use_verl}"
+            f"memory_overload_filter={self.memory_overload_filter}, slow_cut={self.slow_cut.value}"
         )
 
     def set_capacity(self, max_num_seqs: int) -> None:
@@ -117,6 +124,8 @@ class KVCacheAwareStrategy:
             layer_weights=cfg.layer_weights,
             collector_names=cfg.collector_names,
             weight=cfg.weight,
+            memory_overload_filter=cfg.memory_overload_filter,
+            slow_cut=cfg.slow_cut,
         )
 
     def _compute_load(self, kv_usage: float, running: int | float, waiting: int | float) -> float:
@@ -150,10 +159,11 @@ class KVCacheAwareStrategy:
         """Return a pre-built score list if a sticky replica should win, else None.
 
         Sticky wins when ``request_id`` is provided and the bound replica (from
-        ``store.get_sticky_binding``) is present in ``replicas``. In KVCAware mode
-        it must also NOT be overloaded; in verl mode (``USE_VERL_STICKY``) the
-        overload check is skipped. On win, returns a list with ``STICKY_TOP_SCORE``
-        at the bound index and ``0.0`` elsewhere; else ``None`` (fall through).
+        ``store.get_sticky_binding``) is present in ``replicas``. When
+        ``memory_overload_filter`` is set the bound replica must also NOT be
+        overloaded; otherwise the overload check is skipped. On win, returns a
+        list with ``STICKY_TOP_SCORE`` at the bound index and ``0.0`` elsewhere;
+        else ``None`` (fall through).
         """
         if not request_id:
             return None
@@ -162,7 +172,7 @@ class KVCacheAwareStrategy:
             return None
         for idx, replica in enumerate(replicas):
             if replica.replica_id == sticky_id:
-                if not self._use_verl and self.is_overloaded(store, replica):
+                if self.memory_overload_filter and self.is_overloaded(store, replica):
                     logger.info(f"score(): STICKY replica={sticky_id} OVERLOADED → fallback")
                     return None
                 logger.info(f"score(): STICKY replica={sticky_id} HIT → short-circuit (top score)")
@@ -181,9 +191,9 @@ class KVCacheAwareStrategy:
     ) -> list[float]:
         """Score each replica. Larger is better.
 
-        KVCAware mode: ``S = α·S_cache + (1-α)·S_load`` after the sticky
-        short-circuit. verl mode (``USE_VERL_STICKY``): least-inflight fallback
-        (``-INFLIGHT_COUNT``) after an overload-agnostic sticky short-circuit.
+        After the sticky short-circuit misses, the ``slow_cut`` mode selects the
+        fallback scoring: ``prefix-load-aware`` → ``S = α·S_cache + (1-α)·S_load``;
+        ``least-inflight`` → ``-INFLIGHT_COUNT`` (verl GlobalRequestLoadBalancer-style).
         """
         if not isinstance(replicas, list):
             raise StrategyError(f"replicas must be a list, got {type(replicas).__name__}")
@@ -193,7 +203,7 @@ class KVCacheAwareStrategy:
         shortcut = self._sticky_shortcut(store, replicas, request_id)
         if shortcut is not None:
             return shortcut
-        if self._use_verl:
+        if self.slow_cut == SlowCut.LEAST_INFLIGHT:
             return [-store.get_metric(r.replica_id, MetricKey.INFLIGHT_COUNT) for r in replicas]
         effective_prompt_ids = prompt_ids or []
 

@@ -36,6 +36,7 @@ from verl.workers.rollout.router.kvcaware.config import (
     KVCAwareStrategyConfig,
     StrategyConfig,
 )
+from verl.workers.rollout.router.kvcaware.types import SlowCut
 
 # Default collector_names for strategy construction (required field)
 _CN = ["vllm_zmq"]
@@ -145,6 +146,42 @@ class TestStrategyNormalInput:
         """
         cfg = KVCAwareStrategyConfig(weight=1.0, collector_names=_CN)
         assert cfg.layer_weights == {"gpu": 0.7, "cpu": 0.2, "ssd": 0.1}
+
+    def test_s10b_memory_overload_filter_default_true(self):
+        """
+        Feature: memory_overload_filter uses default when omitted
+        Description: construct KVCAwareStrategyConfig without memory_overload_filter
+        Expectation: cfg.memory_overload_filter is True
+        """
+        cfg = KVCAwareStrategyConfig(weight=1.0, collector_names=_CN)
+        assert cfg.memory_overload_filter is True
+
+    def test_s10c_memory_overload_filter_false(self):
+        """
+        Feature: memory_overload_filter=False parses normally
+        Description: construct strategy config with memory_overload_filter=False
+        Expectation: cfg.memory_overload_filter is False
+        """
+        cfg = KVCAwareStrategyConfig(weight=1.0, memory_overload_filter=False, collector_names=_CN)
+        assert cfg.memory_overload_filter is False
+
+    def test_s10d_slow_cut_default_prefix_load_aware(self):
+        """
+        Feature: slow_cut uses default when omitted
+        Description: construct KVCAwareStrategyConfig without slow_cut
+        Expectation: cfg.slow_cut == SlowCut.PREFIX_LOAD_AWARE
+        """
+        cfg = KVCAwareStrategyConfig(weight=1.0, collector_names=_CN)
+        assert cfg.slow_cut == SlowCut.PREFIX_LOAD_AWARE
+
+    def test_s10e_slow_cut_str_coerced(self):
+        """
+        Feature: slow_cut accepts a YAML string and coerces to SlowCut
+        Description: construct strategy config with slow_cut="least-inflight"
+        Expectation: cfg.slow_cut == SlowCut.LEAST_INFLIGHT
+        """
+        cfg = KVCAwareStrategyConfig(weight=1.0, slow_cut="least-inflight", collector_names=_CN)
+        assert cfg.slow_cut == SlowCut.LEAST_INFLIGHT
 
     def test_s11_collector_names_bind(self):
         """
@@ -300,6 +337,24 @@ class TestStrategyAbnormalInput:
         """
         with pytest.raises(ConfigError, match="collector_names must be a list"):
             KVCAwareStrategyConfig(weight=1.0, collector_names="vllm_zmq")
+
+    def test_s22b_memory_overload_filter_non_bool(self):
+        """
+        Feature: non-bool memory_overload_filter triggers validation error
+        Description: construct strategy config with memory_overload_filter="yes"
+        Expectation: raises ConfigError matching "memory_overload_filter"
+        """
+        with pytest.raises(ConfigError, match="memory_overload_filter"):
+            KVCAwareStrategyConfig(weight=1.0, memory_overload_filter="yes", collector_names=_CN)
+
+    def test_s22c_slow_cut_invalid_value(self):
+        """
+        Feature: unknown slow_cut value triggers validation error
+        Description: construct strategy config with slow_cut="random"
+        Expectation: raises ConfigError matching "slow_cut"
+        """
+        with pytest.raises(ConfigError, match="slow_cut"):
+            KVCAwareStrategyConfig(weight=1.0, slow_cut="random", collector_names=_CN)
 
     def test_s23_multi_strategy_weights_not_sum_to_1(self):
         """
@@ -1285,6 +1340,8 @@ class TestKVCAwareOther:
         assert strategy.load_threshold == 0.6
         assert strategy.layer_weights == {"gpu": 0.7, "cpu": 0.2, "ssd": 0.1}
         assert strategy.collector_names == ["vllm_zmq", "vllm_metrics", "sticky_stat", "inflight_stat"]
+        assert strategy.memory_overload_filter is True
+        assert strategy.slow_cut == SlowCut.PREFIX_LOAD_AWARE
         assert result.collector.http_polling == {"polling_interval": 1.0, "http_timeout": 10.0}
         assert result.collector.long_connection == {
             "base_retry_delay": 1.0,
