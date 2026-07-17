@@ -233,6 +233,8 @@ actor_rollout_ref:
       replay_file: null
     _target_: verl.workers.config.TorchTitanActorConfig
   rollout:
+    router_config:
+      max_cache_size: 10000
     _target_: verl.workers.config.RolloutConfig
     name: ???
     mode: async
