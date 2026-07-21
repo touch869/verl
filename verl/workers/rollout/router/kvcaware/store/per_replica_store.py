@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unified metrics store for reading/writing polling metric data."""
+"""Per-replica metric store for reading/writing polled metric data."""
 
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ from typing import Any
 from ..types import METRIC_SPECS
 
 
-class MetricsStore:
-    """Unified metrics store: ``{node_id: {canonical_key: value}}``.
+class PerReplicaStore:
+    """Per-replica metric store: ``{node_id: {canonical_key: value}}``.
 
     - ``get(node_id, key)``  → single value; falls back to ``METRIC_SPECS[key]["default"]``;
                                raises ``KeyError`` if key is not a valid canonical key
@@ -32,14 +32,14 @@ class MetricsStore:
                                existing nodes NOT in ``new_data`` are left untouched
     """
 
-    _instance: MetricsStore | None = None
+    _instance: PerReplicaStore | None = None
 
     def __init__(self) -> None:
         self._data: dict[str, dict[str, Any]] = {}
         self._lock: threading.Lock = threading.Lock()
 
     @classmethod
-    def singleton(cls) -> MetricsStore:
+    def singleton(cls) -> PerReplicaStore:
         """Return the shared singleton instance."""
         if cls._instance is None:
             cls._instance = cls()

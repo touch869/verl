@@ -171,7 +171,11 @@ class KVCacheAwareStrategy:
         running = m.get(MetricKey.NUM_REQUESTS_RUNNING, 0)
         waiting = m.get(MetricKey.NUM_REQUESTS_WAITING, 0)
         inflight = m.get(MetricKey.INFLIGHT_COUNT, 0)
-        return self._compute_load(kv_usage, running, waiting, inflight) > self.load_threshold
+        load = self._compute_load(kv_usage, running, waiting, inflight)
+        # Emit the load the sticky check used (one replica — the bound one) so the
+        # plot can show the overload-check load alongside the combined-score load.
+        logger.info(f"is-overload replica={replica.replica_id} load={load:.4f}")
+        return load > self.load_threshold
 
     def _sticky_shortcut(
         self,
@@ -231,6 +235,7 @@ class KVCacheAwareStrategy:
         effective_prompt_ids = prompt_ids or []
 
         result = []
+        loads: dict[str, float] = {}
         for replica in replicas:
             m = store.get_metrics(replica.replica_id)
             kv_usage = store.kv_cache_load(replica.replica_id)
@@ -238,6 +243,7 @@ class KVCacheAwareStrategy:
             waiting = m.get(MetricKey.NUM_REQUESTS_WAITING, 0)
             inflight = m.get(MetricKey.INFLIGHT_COUNT, 0)
             load = self._compute_load(kv_usage, running, waiting, inflight)
+            loads[replica.replica_id] = load
             s_load = 1.0 - load
             s_cache, gpu_hit = self._cache_score(store, replica, effective_prompt_ids)
             score = self.alpha * s_cache + (1 - self.alpha) * s_load
@@ -249,6 +255,11 @@ class KVCacheAwareStrategy:
             )
         scores_str = ", ".join(f"{r.replica_id}={result[i]:.4f}" for i, r in enumerate(replicas))
         logger.info(f"score(): COMBINED scores: {scores_str}")
+        # Per-replica load that drove this combined-score dispatch (all replicas,
+        # reused from the loop above — no extra computation). The plot parses this
+        # into a per-replica load panel; sticky-win / least-inflight dispatches do
+        # not reach here, so they emit no line (panel omits those dispatches).
+        logger.info(f"route-load loads={loads}")
         return result
 
     def _cache_score(

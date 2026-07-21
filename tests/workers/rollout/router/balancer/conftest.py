@@ -58,11 +58,11 @@ def _conditional_patch(request):
 def _reset_store_singletons():
     """Reset the singleton-backed stores between balancer tests (function-scoped)."""
     from verl.workers.rollout.router.kvcaware.store.kv_cache_store import KVCacheStore
-    from verl.workers.rollout.router.kvcaware.store.metrics_store import MetricsStore
-    from verl.workers.rollout.router.kvcaware.store.sticky_session_store import StickySessionStore
+    from verl.workers.rollout.router.kvcaware.store.per_replica_store import PerReplicaStore
+    from verl.workers.rollout.router.kvcaware.store.per_request_store import PerRequestStore
 
-    for cls in (MetricsStore, KVCacheStore, StickySessionStore):
+    for cls in (PerReplicaStore, KVCacheStore, PerRequestStore):
         cls._instance = None
     yield
-    for cls in (MetricsStore, KVCacheStore, StickySessionStore):
+    for cls in (PerReplicaStore, KVCacheStore, PerRequestStore):
         cls._instance = None

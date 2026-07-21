@@ -39,24 +39,29 @@ class StatisticEvent:
     The three Balancer hook points do not share a stable ``node_id`` and differ
     in arity, so they cannot be forced into ``(raw, node_id)``:
 
-    - ``on_acquire(request_id, chosen)``  → two strings, no node_id
-    - ``on_release(server_id)``           → one string, missing node_id
-    - ``on_servers_removed(ids)``         → list[str], not bytes/str
+    - ``on_acquire(request_id, chosen, prompt_ids)``  → two strings + a token list
+    - ``on_release(server_id)``                       → one string, missing node_id
+    - ``on_servers_removed(ids)``                     → list[str], not bytes/str
 
     Attributes:
         event: Hook name — ``"on_acquire"`` / ``"on_release"`` /
-            ``"on_servers_removed"``.
+            ``on_servers_removed"``.
         request_id: The routing request id (set on ``on_acquire``).
         replica_id: The chosen replica (``on_acquire``) or the released server
             (``on_release``) — unified under one field so one decoder can treat
             both as "the replica this event is about".
         server_ids: Removed server ids (``on_servers_removed``).
+        prompt_len: Input prompt length for ``on_acquire``
+            (``len(prompt_ids)``; 0 when no prompt was forwarded). Lets the
+            inflight decoder attribute the request's size to the receiving
+            replica without re-threading the token list.
     """
 
     event: str
     request_id: str | None = None
     replica_id: str | None = None
     server_ids: tuple[str, ...] = ()
+    prompt_len: int = 0
 
 
 class CallbackTransport(Transport):
@@ -84,8 +89,17 @@ class CallbackTransport(Transport):
         """
         balancer = self._balancer
 
-        def _on_acquire(request_id: str, chosen: str) -> None:
-            handler(StatisticEvent("on_acquire", request_id=request_id, replica_id=chosen), "")
+        def _on_acquire(request_id: str, chosen: str, prompt_ids: list[int] | None = None) -> None:
+            prompt_len = len(prompt_ids) if prompt_ids else 0
+            handler(
+                StatisticEvent(
+                    "on_acquire",
+                    request_id=request_id,
+                    replica_id=chosen,
+                    prompt_len=prompt_len,
+                ),
+                "",
+            )
 
         def _on_release(server_id: str) -> None:
             handler(StatisticEvent("on_release", replica_id=server_id), "")

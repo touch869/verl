@@ -17,7 +17,7 @@
 Each metric is a :class:`Panel` subclass owning its own parsing, series transform,
 axis style, and summary line; :func:`build_panels` returns the ordered list and the
 plot/summary loops just iterate it — adding a panel is writing one subclass and
-appending an instance. Nine panels share the time x-axis; the same replica colour
+appending an instance. Eighteen panels share the time x-axis; the same replica colour
 repeats down the figure so the eye tracks one replica vertically:
 
   1. KV Load (retained)        — kv_cache_load = retained_blocks / num_gpu_blocks
@@ -31,17 +31,46 @@ repeats down the figure so the eye tracks one replica vertically:
   7. gpu prefix hit %          — windowed local prefix-cache hit rate
   8. prefill recompute tokens  — cache-miss prefill tokens over the window
   9. external-hit rate         — cross-replica (mooncake) hits / prefix lookups
+ 10. dispatched samples        — requests dispatched in the last 5 min (per-replica)
+ 11. completed samples         — requests completed in the last 5 min (per-replica)
+ 12. cumul. completed          — lifetime completed-request total per replica
+                                 (raw cumulative counter, not a window delta)
+ 13. avg turn                  — avg dispatch-turn of samples dispatched in the
+                                 last 5 min (per-replica) — re-dispatch / retry churn
+ 14. RPM                       — completed requests / min over the last 5 min (per-replica)
+ 15. avg prompt len            — avg dispatched prompt length over the last 5 min
+                                 (per-replica) — request-size signal seen at dispatch
+ 16. route latency             — balancer route() scoring latency per dispatch
+                                 (global single line; one point per acquire_server)
+ 17. route load (scored)       — per-replica load that drove the combined-score
+                                 dispatch (all replicas; one point per dispatch)
+ 18. load (sticky overload chk)— load of the sticky-bound replica evaluated in
+                                 is_overloaded (one replica per sticky dispatch)
 
-The panel hierarchy captures the two reusable shapes under the leaf panels:
+Panels 1–15 are per-replica (one line each); panels 17–18 are also per-replica
+(instantaneous, one point per dispatch). Panel 16 (route latency) is a single
+global line — route() is a balancer-wide call, not per-replica. Panels 10–15
+derive from the ``router-dispatch`` loguru line; panels 17–18 derive from
+``route-load loads={...}`` and ``is-overload replica=... load=...`` lines
+emitted by the kvcaware strategy — absent on sticky-win / least-inflight
+dispatches, so the panels are skipped when the log has no such lines.
+
+The panel hierarchy captures the reusable shapes under the leaf panels:
 :class:`SlidingPanel` (a windowed per-interval rate — :class:`MFUPanel` is its
-throughput instance) and :class:`CumulativePanel` (a running total folded from
-tally history — :class:`EvictPanel` is its drop-counter instance).
+throughput instance), :class:`CumulativePanel` (a running total folded from
+tally history — :class:`EvictPanel` is its drop-counter instance),
+:class:`TrailingDeltaPanel` (a trailing-window aggregate of the per-replica
+dispatch counters — dispatched/completed/avg-turn/RPM/avg-prompt-len are its
+instances), and :class:`LoadPanel` (per-replica instantaneous load from
+route-load / is-overload lines — panels 17–18 are its instances).
 
-Sources are the ``vllm-evidence ...`` and ``kv-events tally: ... retained_blocks/replica=...``
-loguru lines emitted by the kvcaware collector (parsed by :class:`LogParser`).
-``usage=`` and ``flops=`` are optional (older logs parse fine; those panels stay
-empty). LLM decode is bandwidth-bound, so MFU is naturally low (10-40%) in
-decode-heavy phases — expected, not idle.
+Sources are the ``vllm-evidence ...``, ``kv-events tally: ... retained_blocks/replica=...``,
+``router-dispatch replica=... ...``, ``... routed to server=... route=<ms> ...``,
+``route-load loads={...}``, and ``is-overload replica=... load=...``
+loguru lines emitted by the kvcaware collector/balancer/strategy (parsed by :class:`LogParser`).
+``usage=`` and ``flops=`` are optional
+(older logs parse fine; those panels stay empty). LLM decode is bandwidth-bound,
+so MFU is naturally low (10-40%) in decode-heavy phases — expected, not idle.
 
 Usage:
     python plot_metrics.py LOG [LOG ...]
@@ -57,13 +86,20 @@ import ast
 import re
 import sys
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # ---- fixed defaults (not exposed as CLI flags) -----------------------------
 _YMAX = 1.05  # top of the 0-1 panels (load, usage)
 _MFU_WINDOW_S = 60.0  # realtime MFU sliding-window length (last 1 min)
-_TITLE = "KV Load / usage / MFU / run / wait / evictions / prefix-hit / prefill-recompute / external-hit (time-aligned)"
+# Trailing-window length for the request-dispatch panels (dispatched /
+# completed / avg-turn / RPM). 5 minutes, per the requirement.
+_DISPATCH_WINDOW_S = 300.0
+_TITLE = (
+    "KV Load / usage / MFU / run / wait / evictions / prefix-hit / prefill-recompute / "
+    "external-hit / dispatched / completed / cumul-completed / avg-turn / RPM / "
+    "avg-prompt-len / route-latency / route-load-scored / sticky-overload-load (time-aligned)"
+)
 
 
 # ---- pipeline downsampling (generic, not metric-specific) -------------------
@@ -79,7 +115,8 @@ def _downsample(points: list, max_n: int) -> list:
 class LogParser:
     """Parses kvcaware-collector loguru lines into ``(ts, kind, fields)``.
 
-    ``kind`` is ``'evidence'`` or ``'tally'``; ``fields`` is the regex groupdict;
+    ``kind`` is ``'evidence'`` / ``'tally'`` / ``'dispatch'`` / ``'route'`` /
+    ``'route_load'`` / ``'is_overload'``; ``fields`` is the regex groupdict;
     ``ts`` may be None (the caller skips it to keep the time axis honest).
     """
 
@@ -95,10 +132,38 @@ class LogParser:
     )
     # Anchor on `retained_blocks/replica=` so the earlier events={...} dict isn't captured.
     _TALLY = re.compile(r"retained_blocks/replica=(?P<d>\{[^}]*\})")
+    # router-dispatch replica=<id> dispatched=<cumul> completed=<cumul> turn_sum=<cumul>
+    #   prompt_len_sum=<cumul> ...
+    # Carries per-replica cumulative counters; the plot derives trailing-window
+    # panels from their per-replica deltas. The trailing [dispatch #N] is ignored.
+    # prompt_len_sum is optional so older logs (pre-request-length tracking) still
+    # parse — it defaults to 0 and the avg-prompt-len panel stays flat/empty.
+    _DISPATCH = re.compile(
+        r"router-dispatch\s+replica=(?P<rep>\S+)\s+dispatched=(?P<dispatched>\d+)"
+        r"\s+completed=(?P<completed>\d+)\s+turn_sum=(?P<turn_sum>\d+)"
+        r"(?:\s+prompt_len_sum=(?P<prompt_len_sum>\d+))?"
+    )
+    # request=<uuid> routed to server=<addr> (ranking=.., pool=.., route=<ms>, strategy=[..])
+    # route= is the per-dispatch route() scoring latency in ms; one line per acquire_server.
+    _ROUTE = re.compile(r"routed to server=(?P<srv>\S+).*?route=(?P<route>[\d.]+)ms")
+    # route-load loads={'s0': 0.4213, 's1': 0.1822} — per-replica load (all replicas) that drove
+    # a combined-score dispatch, emitted once per such dispatch from score(). dict form mirrors
+    # the tally line (ast.literal_eval). Absent on sticky-win / least-inflight dispatches.
+    _ROUTE_LOAD = re.compile(r"route-load\s+loads=(?P<d>\{[^}]*\})")
+    # is-overload replica=<id> load=<val> — the load of the sticky-bound replica that the
+    # overload check (is_overloaded) evaluated, one replica per sticky-check dispatch.
+    _IS_OVERLOAD = re.compile(r"is-overload\s+replica=(?P<rep>\S+)\s+load=(?P<load>[\d.]+)")
     _TS_LOGURU = re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[,.]\d+)?")
     _TS_VLLM = re.compile(r"INFO\s+(?P<ts>\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
     _ASSUMED_YEAR = 2026  # vLLM engine logs omit the year; router (loguru) logs carry a full date.
-    _ANCHORS = ("vllm-evidence", "retained_blocks/replica=")
+    _ANCHORS = (
+        "vllm-evidence",
+        "retained_blocks/replica=",
+        "router-dispatch",
+        "routed to server",
+        "route-load loads=",
+        "is-overload replica=",
+    )
 
     @classmethod
     def is_signal(cls, line: str) -> bool:
@@ -113,6 +178,18 @@ class LogParser:
         m = cls._TALLY.search(line)
         if m:
             return cls._ts(line), "tally", m.groupdict()
+        m = cls._DISPATCH.search(line)
+        if m:
+            return cls._ts(line), "dispatch", m.groupdict()
+        m = cls._ROUTE.search(line)
+        if m:
+            return cls._ts(line), "route", m.groupdict()
+        m = cls._ROUTE_LOAD.search(line)
+        if m:
+            return cls._ts(line), "route_load", m.groupdict()
+        m = cls._IS_OVERLOAD.search(line)
+        if m:
+            return cls._ts(line), "is_overload", m.groupdict()
         return None
 
     @classmethod
@@ -167,6 +244,34 @@ class Panel:
         return points
 
     def derive(self, retained: dict):
+        return None
+
+    def derive_dispatch(self, dispatch: dict):
+        """Build the per-replica series from the dispatch buffer; default None.
+
+        Parallel to :meth:`derive` (which feeds off the per-replica retained
+        history): dispatch panels override this to fold each replica's
+        ``[(ts, dispatched, completed, turn_sum), ...]`` buffer into a
+        ``{replica: [(ts, val), ...]}`` series (one line per replica).
+        """
+        return None
+
+    def derive_route(self, route_lat):
+        """Build the series from the global route-latency buffer; default None.
+
+        Parallel to :meth:`derive_dispatch`: route panels override this to fold
+        the flat global ``[(ts, ms), ...]`` buffer into a series. Default None
+        so the main loop can call it uniformly on every panel.
+        """
+        return None
+
+    def derive_loads(self, route_load, is_overload):
+        """Build the series from the route-load / is-overload buffers; default None.
+
+        Both buffers are ``{replica: [(ts, load), ...]}``. Load panels override
+        this, picking one buffer via ``self.source``. Default None so the main
+        loop can call it uniformly on every panel.
+        """
         return None
 
     # -- render --
@@ -356,7 +461,278 @@ class EvictPanel(CumulativePanel):
         super().__init__("evict", "total gpu block evict", **kw)
 
 
-def build_panels(peak_tflops: float) -> list[Panel]:
+# ---- request-dispatch (per-replica) panels ---------------------------------
+def _trailing_deltas(dispatch: list, window_s: float):
+    """Trailing-window deltas of the per-replica cumulative dispatch counters.
+
+    ``dispatch`` is a list of ``(ts, dispatched, completed, turn_sum, prompt_len_sum)``
+    sorted by ``ts``. For each point we subtract the value observed at the latest point
+    whose timestamp is ``<= ts - window_s`` (0 before the run starts) — i.e. the
+    count of events that landed inside the trailing ``window_s`` window. Returns
+    a list of ``(ts, dispatched_delta, completed_delta, turn_sum_delta, prompt_len_sum_delta)``.
+
+    O(n²) over the number of dispatch lines, which is tiny for an offline plot
+    pass (the line is time-throttled to ~every 5 s on the producer side).
+    """
+    out = []
+    for i, (ts, d, c, s, p) in enumerate(dispatch):
+        cutoff = ts - timedelta(seconds=window_s)
+        bd = bc = bs = bp = 0
+        for j in range(i, -1, -1):
+            if dispatch[j][0] <= cutoff:
+                _, bd, bc, bs, bp = dispatch[j]
+                break
+        out.append((ts, d - bd, c - bc, s - bs, p - bp))
+    return out
+
+
+class TrailingDeltaPanel(Panel):
+    """Base for the per-replica request-dispatch panels.
+
+    Subclasses pick one column out of :func:`_trailing_deltas` via
+    :meth:`select`. These panels do NOT read per-line evidence fields — they
+    derive entirely from the per-replica ``router-dispatch`` cumulative
+    buffers — so they are skipped by the evidence extraction loop (like
+    ``CumulativePanel``). Produces one series per replica.
+    """
+
+    def derive_dispatch(self, dispatch: dict):
+        out = {}
+        for rep, hist in dispatch.items():
+            if not hist:
+                continue
+            deltas = _trailing_deltas(hist, _DISPATCH_WINDOW_S)
+            pts = [(ts, self.select(dd, dc, ds, dp)) for ts, dd, dc, ds, dp in deltas]
+            if pts:
+                out[rep] = pts
+        return out
+
+    @staticmethod
+    def select(
+        dispatched_delta: float,
+        completed_delta: float,
+        turn_sum_delta: float,
+        prompt_len_sum_delta: float,
+    ) -> float:
+        raise NotImplementedError
+
+
+class DispatchedPanel(TrailingDeltaPanel):
+    """Requests dispatched in the last 5 min (trailing-window delta)."""
+
+    def __init__(self, **kw):
+        super().__init__(
+            "dispatched",
+            f"dispatched samples\n(last {int(_DISPATCH_WINDOW_S / 60)} min)",
+            summary=Panel.last("dispatched", ".0f"),
+            **kw,
+        )
+
+    @staticmethod
+    def select(dispatched_delta, completed_delta, turn_sum_delta, prompt_len_sum_delta):
+        return float(dispatched_delta)
+
+
+class CompletedPanel(TrailingDeltaPanel):
+    """Requests completed in the last 5 min (trailing-window delta)."""
+
+    def __init__(self, **kw):
+        super().__init__(
+            "completed",
+            f"completed samples\n(last {int(_DISPATCH_WINDOW_S / 60)} min)",
+            summary=Panel.last("completed", ".0f"),
+            **kw,
+        )
+
+    @staticmethod
+    def select(dispatched_delta, completed_delta, turn_sum_delta, prompt_len_sum_delta):
+        return float(completed_delta)
+
+
+class CumulativeCompletedPanel(Panel):
+    """Cumulative completed requests per replica — the raw lifetime total.
+
+    Unlike :class:`CompletedPanel` (a trailing-5-min window delta), this plots
+    the cumulative ``completed`` counter verbatim at each snapshot: how many
+    requests that replica has completed so far, lifetime. One monotonically
+    rising line per replica — the realized-throughput share over the whole run.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(
+            "completed_total",
+            "cumul. completed\n(lifetime total)",
+            summary=Panel.cum("completed_total"),
+            **kw,
+        )
+
+    def derive_dispatch(self, dispatch: dict):
+        """Fold each replica's history into ``(ts, completed_cumulative)``.
+
+        The dispatch buffer already carries the cumulative ``completed``
+        counter as its third element, so this panel just reads it directly —
+        no windowed delta (that is :class:`CompletedPanel`'s job).
+        """
+        out = {}
+        for rep, hist in dispatch.items():
+            if not hist:
+                continue
+            pts = [(ts, float(c)) for ts, _d, c, _s, _p in hist]
+            if pts:
+                out[rep] = pts
+        return out
+
+
+class AvgTurnPanel(TrailingDeltaPanel):
+    """Average turn of dispatched samples in the last 5 min (turn_sum/dispatched)."""
+
+    def __init__(self, **kw):
+        super().__init__(
+            "avg_turn",
+            f"avg turn\n(dispatched, last {int(_DISPATCH_WINDOW_S / 60)} min)",
+            summary=Panel.last("avg_turn", ".3f"),
+            **kw,
+        )
+
+    @staticmethod
+    def select(dispatched_delta, completed_delta, turn_sum_delta, prompt_len_sum_delta):
+        # avg turn over the window = (turns accumulated) / (dispatches accumulated).
+        # No dispatches in the window → NaN (matplotlib skips the gap).
+        return float(turn_sum_delta) / dispatched_delta if dispatched_delta > 0 else float("nan")
+
+
+class RPMPanel(TrailingDeltaPanel):
+    """Requests-per-minute over the last 5 min (completed / window minutes)."""
+
+    def __init__(self, **kw):
+        super().__init__(
+            "rpm",
+            f"RPM\n(completed, last {int(_DISPATCH_WINDOW_S / 60)} min)",
+            summary=Panel.last("rpm", ".1f"),
+            **kw,
+        )
+
+    @staticmethod
+    def select(dispatched_delta, completed_delta, turn_sum_delta, prompt_len_sum_delta):
+        window_min = _DISPATCH_WINDOW_S / 60.0
+        return float(completed_delta) / window_min
+
+
+class AvgPromptLenPanel(TrailingDeltaPanel):
+    """Average dispatched prompt length in the last 5 min (prompt_len_sum/dispatched).
+
+    The request-size signal the router sees at dispatch time: cumulative
+    ``len(prompt_ids)`` over the window's dispatched samples divided by the
+    window's dispatched count. Mirrors :class:`AvgTurnPanel`'s
+    sum-over-counters shape — prompt_len_sum is to request-size what turn_sum
+    is to re-dispatch churn.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(
+            "avg_prompt_len",
+            f"avg prompt len\n(dispatched, last {int(_DISPATCH_WINDOW_S / 60)} min)",
+            summary=Panel.last("avg_prompt_len", ".0f"),
+            **kw,
+        )
+
+    @staticmethod
+    def select(dispatched_delta, completed_delta, turn_sum_delta, prompt_len_sum_delta):
+        # avg prompt len over the window = (prompt lengths accumulated) / (dispatches).
+        # No dispatches in the window → NaN (matplotlib skips the gap).
+        return float(prompt_len_sum_delta) / dispatched_delta if dispatched_delta > 0 else float("nan")
+
+
+class RouteLatencyPanel(Panel):
+    """Global per-dispatch route() latency — one line, one point per dispatch.
+
+    Unlike every other panel, this is a single global series: route() is a
+    balancer-wide scoring call, not per-replica. It stores under the pseudo-
+    replica key ``_GLOBAL`` so the existing ``{replica: [(ts, val)]}`` series
+    structure is reused unchanged, and ``draw()`` plots one line instead of
+    iterating the replica order. Instantaneous values (one point per dispatch);
+    no windowed aggregation.
+    """
+
+    _GLOBAL = "__global__"
+
+    def __init__(self, **kw):
+        super().__init__(
+            "route_lat", "route latency\n(ms per dispatch)", summary=Panel.last("route", ".2f", "ms"), **kw
+        )
+
+    def derive_route(self, route_lat):
+        """Fold the flat global [(ts, ms)] buffer into a single-replica series."""
+        return {self._GLOBAL: list(route_lat)} if route_lat else None
+
+    def draw(self, ax, data, colors, order) -> None:
+        pts = data.get(self.key, {}).get(self._GLOBAL, [])
+        if pts:
+            ax.plot(
+                [p[0] for p in pts],
+                [p[1] for p in pts],
+                color="tab:red",
+                linestyle="-",
+                linewidth=1.5,
+                alpha=0.9,
+                label="route latency",
+            )
+        ax.set_ylabel(self.ylabel)
+        ax.grid(True, alpha=0.3)
+
+    def summarize(self, data, rep):
+        # Global series lives under _GLOBAL, not under a replica — ignore `rep`.
+        pts = data.get(self.key, {}).get(self._GLOBAL, [])
+        return self._summary(pts) if self._summary else ""
+
+
+class LoadPanel(Panel):
+    """Base for per-replica load panels fed from route-load / is-overload buffers.
+
+    Subclasses set ``source`` to ``"route_load"`` or ``"is_overload"``; the
+    common :meth:`derive_loads` hook picks the right buffer.  Both draw one
+    line per replica (instantaneous load ∈ [0,1]) and a horizontal line at the
+    overload threshold — each subclass's ``__init__`` sets ``hline``.
+    """
+
+    source: str  # set by subclass: "route_load" or "is_overload"
+
+    def derive_loads(self, route_load, is_overload):
+        buf = route_load if self.source == "route_load" else is_overload
+        return {rep: list(pts) for rep, pts in buf.items()} or None
+
+
+class RouteLoadPanel(LoadPanel):
+    """Per-replica load that drove the combined-score dispatch (all replicas)."""
+
+    def __init__(self, *, load_threshold: float, **kw):
+        super().__init__(
+            "route_load_scored",
+            f"route load (scored)\n(threshold={load_threshold:.2f})",
+            ylim_top=1.0,
+            hline=load_threshold,
+            summary=Panel.last("rload", ".3f"),
+            **kw,
+        )
+        self.source = "route_load"
+
+
+class StickyOverloadPanel(LoadPanel):
+    """Load of the sticky-bound replica evaluated in is_overloaded (one replica per dispatch)."""
+
+    def __init__(self, *, load_threshold: float, **kw):
+        super().__init__(
+            "sticky_overload_load",
+            f"load (sticky overload chk)\n(threshold={load_threshold:.2f})",
+            ylim_top=1.0,
+            hline=load_threshold,
+            summary=Panel.last("sload", ".3f"),
+            **kw,
+        )
+        self.source = "is_overload"
+
+
+def build_panels(peak_tflops: float, load_threshold: float = 0.9) -> list[Panel]:
     """The ordered panel list (plot order = axis order = summary order)."""
     return [
         FieldPanel(
@@ -404,35 +780,84 @@ def build_panels(peak_tflops: float) -> list[Panel]:
             summary=Panel.last("prefill", ""),
         ),
         FieldPanel("ext", "external-hit", Panel.ext_rate, ylim_top=1.05, summary=Panel.last("ext", ".4f")),
+        # ── Per-replica request-dispatch panels (one line per replica) ──
+        DispatchedPanel(height=2.0),
+        CompletedPanel(height=2.0),
+        CumulativeCompletedPanel(height=2.0),
+        AvgTurnPanel(height=2.0),
+        RPMPanel(height=2.0),
+        AvgPromptLenPanel(height=2.0),
+        RouteLatencyPanel(height=2.0),
+        # ── Per-replica per-dispatch load panels (one line per replica) ──
+        RouteLoadPanel(height=2.0, load_threshold=load_threshold),
+        StickyOverloadPanel(height=2.0, load_threshold=load_threshold),
     ]
 
 
 # ---- pipeline ---------------------------------------------------------------
 class Bundle:
-    def __init__(self, series, retained, replicas, t_min, t_max, n_ev, n_tally, n_no_ts):
+    def __init__(
+        self,
+        series,
+        retained,
+        dispatch,
+        route_lat,
+        route_load,
+        is_overload,
+        replicas,
+        t_min,
+        t_max,
+        n_ev,
+        n_tally,
+        n_dispatch,
+        n_route,
+        n_route_load,
+        n_is_overload,
+        n_no_ts,
+    ):
         self.series = series  # {panel_key: {replica: [(ts, val), ...]}}
         self.retained = retained  # {replica: [(ts, n), ...]}
+        self.dispatch = dispatch  # {replica: [(ts, dispatched, completed, turn_sum, prompt_len_sum), ...]}
+        self.route_lat = route_lat  # [(ts, ms), ...] global flat — route() is balancer-wide
+        self.route_load = route_load  # {replica: [(ts, load), ...]} — score() combined-path per-replica load
+        self.is_overload = is_overload  # {replica: [(ts, load), ...]} — is_overloaded() bound-replica load
         self.replicas = replicas
         self.t_min = t_min
         self.t_max = t_max
         self.n_ev = n_ev
         self.n_tally = n_tally
+        self.n_dispatch = n_dispatch
+        self.n_route = n_route
+        self.n_route_load = n_route_load
+        self.n_is_overload = n_is_overload
         self.n_no_ts = n_no_ts
 
 
 def collect(paths, panels: list[Panel]) -> Bundle:
-    """Parse logs into per-panel series + retained buffers.
+    """Parse logs into per-panel series + retained/dispatch buffers.
 
     Tracks the global [t_min, t_max] during the single parse pass so later
     truncation needs no second scan.
     """
-    # Cumulative panels derive from the tally history, not from evidence lines.
-    extract_panels = [p for p in panels if not isinstance(p, CumulativePanel)]
+    # Derived panels (cumulative from tally, dispatch/cumulative-completed from
+    # the dispatch buffer) are skipped by the evidence extraction loop — they get
+    # their series via derive() / derive_dispatch() in main().
+    extract_panels = [
+        p
+        for p in panels
+        if not isinstance(
+            p, CumulativePanel | TrailingDeltaPanel | RouteLatencyPanel | CumulativeCompletedPanel | LoadPanel
+        )
+    ]
     series = {p.key: defaultdict(list) for p in extract_panels}
     retained: dict = defaultdict(list)
+    dispatch: dict = defaultdict(list)
+    route_lat: list = []
+    route_load: dict = defaultdict(list)
+    is_overload: dict = defaultdict(list)
     replicas: set[str] = set()
     t_min = t_max = None
-    n_ev = n_tally = n_no_ts = 0
+    n_ev = n_tally = n_dispatch = n_route = n_route_load = n_is_overload = n_no_ts = 0
 
     for path in paths:
         try:
@@ -465,7 +890,7 @@ def collect(paths, panels: list[Panel]) -> Bundle:
                         if v is not None:
                             series[p.key][rep].append((ts, v))
                     n_ev += 1
-                else:  # tally
+                elif kind == "tally":
                     try:
                         d = ast.literal_eval(g["d"])
                     except Exception:
@@ -474,8 +899,50 @@ def collect(paths, panels: list[Panel]) -> Bundle:
                         replicas.add(rep)
                         retained[rep].append((ts, int(n)))
                     n_tally += 1
+                elif kind == "dispatch":  # per-replica cumulative snapshot
+                    rep = g["rep"]
+                    replicas.add(rep)
+                    # prompt_len_sum defaults to 0 for older logs that predate the
+                    # request-length tracking (regex made it optional).
+                    pls = int(g.get("prompt_len_sum") or 0)
+                    dispatch[rep].append((ts, int(g["dispatched"]), int(g["completed"]), int(g["turn_sum"]), pls))
+                    n_dispatch += 1
+                elif kind == "route":  # global per-dispatch latency (not per-replica)
+                    route_lat.append((ts, float(g["route"])))
+                    n_route += 1
+                elif kind == "route_load":  # score() combined-path per-replica load snapshot
+                    try:
+                        d = ast.literal_eval(g["d"])
+                    except Exception:
+                        continue
+                    for rep, load in d.items():
+                        replicas.add(rep)
+                        route_load[rep].append((ts, float(load)))
+                    n_route_load += 1
+                elif kind == "is_overload":  # is_overloaded() bound-replica load check
+                    rep = g["rep"]
+                    replicas.add(rep)
+                    is_overload[rep].append((ts, float(g["load"])))
+                    n_is_overload += 1
 
-    return Bundle(series, retained, replicas, t_min, t_max, n_ev, n_tally, n_no_ts)
+    return Bundle(
+        series,
+        retained,
+        dispatch,
+        route_lat,
+        route_load,
+        is_overload,
+        replicas,
+        t_min,
+        t_max,
+        n_ev,
+        n_tally,
+        n_dispatch,
+        n_route,
+        n_route_load,
+        n_is_overload,
+        n_no_ts,
+    )
 
 
 def prepare(panels: list[Panel], series: dict, t_cut, max_points: int, peak_flops: float) -> dict:
@@ -506,7 +973,7 @@ def plot(plt, panels: list[Panel], data: dict, order: list, colors: dict, out: s
         len(panels),
         1,
         sharex=True,
-        figsize=(14, 31),
+        figsize=(14, max(31, sum(p.height for p in panels) * 1.55 + 2)),
         gridspec_kw={"height_ratios": [p.height for p in panels]},
     )
     for p, ax in zip(panels, axes, strict=False):
@@ -529,7 +996,11 @@ def plot(plt, panels: list[Panel], data: dict, order: list, colors: dict, out: s
 def print_summary(
     panels: list[Panel], data: dict, bundle: Bundle, order: list, max_evict, peak_tflops: float, out: str
 ) -> None:
-    print(f"OK: {bundle.n_ev} evidence lines, {bundle.n_tally} tally lines, {len(bundle.replicas)} replicas -> {out}")
+    print(
+        f"OK: {bundle.n_ev} evidence lines, {bundle.n_tally} tally lines, "
+        f"{bundle.n_dispatch} dispatch lines, {bundle.n_route_load} route-load lines, "
+        f"{bundle.n_is_overload} is-overload lines, {len(bundle.replicas)} replicas -> {out}"
+    )
     print(f"   peak={peak_tflops:.0f} TFLOPS/NPU, mfu_window={_MFU_WINDOW_S:.0f}s, max cum evictions={max_evict}")
     print("   per-replica summary:")
     for rep in order:
@@ -538,7 +1009,9 @@ def print_summary(
 
 
 def parse_args(argv=None):
-    ap = argparse.ArgumentParser(description="Per-replica KV + MFU signals (9 time-aligned panels)")
+    ap = argparse.ArgumentParser(
+        description="Per-replica KV + MFU + global dispatch + load + route-latency signals (18 time-aligned panels)"
+    )
     ap.add_argument("logs", nargs="+", help="log file(s)")
     ap.add_argument("--frac", type=float, default=1.0, help="plot first FRAC of the time window; (0,1]")
     ap.add_argument("--max-points", type=int, default=2000, help="downsample each curve; 0 disables")
@@ -547,6 +1020,12 @@ def parse_args(argv=None):
         type=float,
         default=560.0,
         help="per-NPU peak FLOPs/s in TFLOPS (MFU denominator). 560=Atlas 800I A3 FP16/NPU (default), 750=800T A3.",
+    )
+    ap.add_argument(
+        "--load-threshold",
+        type=float,
+        default=0.9,
+        help="overload threshold for load panel hlines (default 0.9).",
     )
     args = ap.parse_args(argv)
     if not (0.0 < args.frac <= 1.0):
@@ -574,7 +1053,7 @@ def main(argv=None) -> int:
     if plt is None:
         return 2
 
-    panels = build_panels(args.peak_tflops)
+    panels = build_panels(args.peak_tflops, args.load_threshold)
     bundle = collect(args.logs, panels)
     if bundle.n_no_ts:
         print(f"WARN: {bundle.n_no_ts} signal lines had no parseable timestamp — skipped", file=sys.stderr)
@@ -582,23 +1061,39 @@ def main(argv=None) -> int:
         print(f"ERROR: no vllm-evidence / kv-events tally lines found in {args.logs}", file=sys.stderr)
         return 1
 
-    for p in panels:  # populate derived panels (evictions from tally history)
+    for p in panels:  # populate derived panels (evictions from tally, dispatch/load from global buffers)
         derived = p.derive(bundle.retained)
         if derived is not None:
             bundle.series[p.key] = derived
+        derived_lc = p.derive_dispatch(bundle.dispatch)
+        if derived_lc is not None:
+            bundle.series[p.key] = derived_lc
+        derived_rt = p.derive_route(bundle.route_lat)
+        if derived_rt is not None:
+            bundle.series[p.key] = derived_rt
+        derived_loads = p.derive_loads(bundle.route_load, bundle.is_overload)
+        if derived_loads is not None:
+            bundle.series[p.key] = derived_loads
 
     t_cut = None
     if args.frac < 1.0 and bundle.t_min is not None:
         t_cut = bundle.t_min + (bundle.t_max - bundle.t_min) * args.frac
     data = prepare(panels, bundle.series, t_cut, args.max_points, args.peak_tflops * 1e12)
 
-    max_evict = max((pts[-1][1] for pts in data["evict"].values() if pts), default=0)
+    # Drop panels that got no data (e.g. load panels when the log has zero
+    # route-load / is-overload lines — sticky-only or least-inflight-only runs).
+    active = [p for p in panels if data.get(p.key)]
+    if not active:
+        print("ERROR: all panels empty after prepare", file=sys.stderr)
+        return 1
+
+    max_evict = max((pts[-1][1] for pts in data.get("evict", {}).values() if pts), default=0)
     order = compute_order(data["load"], bundle.replicas)
     cmap = plt.get_cmap("tab10" if len(order) <= 10 else "tab20")
     colors = {rep: cmap(i % cmap.N) for i, rep in enumerate(order)}
 
-    plot(plt, panels, data, order, colors, args.out)
-    print_summary(panels, data, bundle, order, max_evict, args.peak_tflops, args.out)
+    plot(plt, active, data, order, colors, args.out)
+    print_summary(active, data, bundle, order, max_evict, args.peak_tflops, args.out)
     return 0
 
 
