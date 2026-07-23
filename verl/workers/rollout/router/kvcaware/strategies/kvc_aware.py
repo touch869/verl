@@ -76,6 +76,7 @@ class KVCacheAwareStrategy:
         memory_overload_filter: bool = True,
         slow_cut: SlowCut | str = SlowCut.PREFIX_LOAD_AWARE,
         load_weights: tuple[float, float, float, float] = DEFAULT_LOAD_WEIGHTS,
+        capacity_filter_frac: float = 0.05,
     ) -> None:
         if not 0 <= alpha <= 1:
             raise StrategyError(f"alpha must be in [0, 1], got {alpha}")
@@ -100,6 +101,8 @@ class KVCacheAwareStrategy:
             raise StrategyError(f"load_weights must be 4 non-negative values, got {load_weights}")
         if abs(sum(load_weights) - 1.0) > 1e-6:
             raise StrategyError(f"load_weights must sum to 1.0, got {sum(load_weights)}")
+        if not 0.0 <= capacity_filter_frac < 1.0:
+            raise StrategyError(f"capacity_filter_frac must be in [0, 1), got {capacity_filter_frac}")
 
         self.alpha = float(alpha)
         self.load_threshold = float(load_threshold)
@@ -109,11 +112,13 @@ class KVCacheAwareStrategy:
         self.memory_overload_filter = memory_overload_filter
         self.slow_cut = slow_cut
         self.load_weights = tuple(load_weights)
+        self.capacity_filter_frac = float(capacity_filter_frac)
         self._max_num_seqs: int | None = None
         logger.info(
             f"KVCacheAwareStrategy created: alpha={self.alpha:.2f}, "
             f"load_threshold={self.load_threshold:.2f}, load_weights={self.load_weights}, "
-            f"memory_overload_filter={self.memory_overload_filter}, slow_cut={self.slow_cut.value}"
+            f"memory_overload_filter={self.memory_overload_filter}, slow_cut={self.slow_cut.value}, "
+            f"capacity_filter_frac={self.capacity_filter_frac}"
         )
 
     def set_capacity(self, max_num_seqs: int) -> None:
@@ -135,6 +140,7 @@ class KVCacheAwareStrategy:
             weight=cfg.weight,
             memory_overload_filter=cfg.memory_overload_filter,
             slow_cut=cfg.slow_cut,
+            capacity_filter_frac=cfg.capacity_filter_frac,
         )
 
     def _compute_load(
@@ -232,6 +238,8 @@ class KVCacheAwareStrategy:
             return shortcut
         if self.slow_cut == SlowCut.LEAST_INFLIGHT:
             return [-store.get_metric(r.replica_id, MetricKey.INFLIGHT_COUNT) for r in replicas]
+        if self.slow_cut == SlowCut.CAPACITY_TOKEN_AWARE:
+            return self._capacity_token_scores(store, replicas, prompt_ids or [])
         effective_prompt_ids = prompt_ids or []
 
         result = []
@@ -282,6 +290,105 @@ class KVCacheAwareStrategy:
         w = self.layer_weights
         s_cache = w[Layer.GPU] * gpu_hit + w[Layer.CPU] * cpu_hit + w[Layer.SSD] * ssd_hit
         return s_cache, gpu_hit
+
+    # ── Capacity-gated token routing (CAPACITY_TOKEN_AWARE) ───────────
+
+    def _total_token_capacity(self, store: DataStore) -> int:
+        """Per-replica KV-cache token capacity = ``num_gpu_blocks × block_size``.
+
+        ``num_gpu_blocks`` is a per-replica gauge (constant across replicas in
+        practice); ``block_size`` is learned from the first KV event (defaults
+        to 16 if not yet seen). Returns 0 when unavailable, in which case the
+        caller falls back to least-inflight.
+        """
+        for node_id in store.get_metric_node_ids():
+            nblk = store.get_metric(node_id, MetricKey.NUM_GPU_BLOCKS)
+            if nblk and nblk > 0:
+                block_size = store.get_block_size() or 16
+                return int(nblk) * int(block_size)
+        return 0
+
+    def _capacity_token_scores(
+        self,
+        store: DataStore,
+        replicas: list[ReplicaInfo],
+        prompt_ids: list[int],
+    ) -> list[float]:
+        """Capacity-gated token routing (discrete: winner=STICKY_TOP_SCORE, rest 0).
+
+        Borrowed from ThunderAgent: cache is a *prefill increment* (not an
+        additive score term), and a *pure capacity gate* (free tokens, not the
+        cache-laden ``remaining``) keeps cache-rich-but-physically-full replicas
+        out of the candidate set — the structural fix for cache kidnapping under
+        ``plen ≈ cap`` (a single prompt's prefill ≈ a replica's KV budget).
+
+        For each replica ``i``::
+
+            avail[i]     = cap × (1 - kv_cache_usage_perc[i])   # free tokens (no cache)
+            need[i]      = len(prompt_ids) × (1 - gpu_hit[i])    # prefill this req adds
+            remaining[i] = avail[i] - need[i]                   # free tokens after assign
+            eligible[i]  = avail[i] >= cap × capacity_filter_frac   # pure capacity gate
+
+        Pick ``argmax(eligible, remaining)``; cold start (``kv_cache_usage_perc`` all
+        ≈ 0) falls back to least-inflight; no eligible replica falls back to max
+        ``remaining`` (route must succeed).
+        """
+        n = len(replicas)
+        cap = self._total_token_capacity(store)
+        plen = len(prompt_ids) if prompt_ids else 0
+        rows: list[dict] = []
+        for replica in replicas:
+            kv_perc = store.get_metric(replica.replica_id, MetricKey.KV_CACHE_USAGE_PERC) or 0.0
+            inflight = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_COUNT) or 0
+            s_cache, gpu_hit = self._cache_score(store, replica, prompt_ids)
+            avail = cap * (1.0 - kv_perc)
+            need = plen * (1.0 - gpu_hit)
+            remaining = avail - need
+            rows.append(
+                {
+                    "replica": replica,
+                    "kv_perc": kv_perc,
+                    "inflight": inflight,
+                    "gpu_hit": gpu_hit,
+                    "s_cache": s_cache,
+                    "avail": avail,
+                    "need": need,
+                    "remaining": remaining,
+                }
+            )
+
+        # Cold start: kv_cache_usage_perc all ~0 (metrics not polled yet) → inflight.
+        if cap == 0 or all(row["kv_perc"] < 1e-2 for row in rows):
+            top = min(range(n), key=lambda i: rows[i]["inflight"])
+            logger.info("score(): CAPACITY_TOKEN_AWARE cold-start → least-inflight")
+        else:
+            thresh = cap * self.capacity_filter_frac
+            eligible = [i for i in range(n) if rows[i]["avail"] >= thresh]
+            if not eligible:
+                top = max(range(n), key=lambda i: rows[i]["remaining"])
+                logger.info("score(): CAPACITY_TOKEN_AWARE no eligible → max remaining")
+            else:
+                top = max(eligible, key=lambda i: rows[i]["remaining"])
+
+        for i, row in enumerate(rows):
+            tag = " ← WINNER" if i == top else ""
+            logger.info(
+                f"score(): replica={row['replica'].replica_id} kv_perc={row['kv_perc']:.3f} "
+                f"gpu_hit={row['gpu_hit']:.3f} inflight={row['inflight']} "
+                f"avail={row['avail']:.0f} need={row['need']:.0f} "
+                f"remaining={row['remaining']:.0f}{tag}"
+            )
+        winner = rows[top]["replica"].replica_id
+        logger.info(
+            f"score(): CAPACITY_TOKEN_AWARE winner={winner} "
+            f"(kv_perc={rows[top]['kv_perc']:.3f}, remaining={rows[top]['remaining']:.0f})"
+        )
+        # Per-replica capacity signal for the plot (mirrors route-load in prefix-load-aware).
+        cap_loads = {row["replica"].replica_id: row["remaining"] for row in rows}
+        logger.info(f"route-capacity remaining={cap_loads}")
+        scores = [0.0] * n
+        scores[top] = STICKY_TOP_SCORE
+        return scores
 
 
 StrategyRegistry.register(KVCAwareStrategyConfig, KVCacheAwareStrategy)

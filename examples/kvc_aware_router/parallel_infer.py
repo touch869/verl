@@ -119,6 +119,8 @@ def init_config(args: argparse.Namespace) -> DictConfig:
         strat0.memory_overload_filter = args.memory_overload_filter
     if args.slow_cut is not None:
         strat0.slow_cut = args.slow_cut
+    if args.capacity_filter_frac is not None:
+        strat0.capacity_filter_frac = args.capacity_filter_frac
 
     return config
 
@@ -326,9 +328,17 @@ def main():
     parser.add_argument(
         "--slow-cut",
         type=str,
-        choices=["prefix-load-aware", "least-inflight"],
+        choices=["prefix-load-aware", "least-inflight", "capacity-token-aware"],
         default=None,
         help="KVCAware strategy[0] slow_cut fallback scoring mode. Overrides kvcaware.yaml when set.",
+    )
+    parser.add_argument(
+        "--capacity-filter-frac",
+        type=float,
+        default=None,
+        help="KVCAware strategy[0] capacity_filter_frac (capacity-token-aware only) — replicas whose "
+        "free token capacity is below cap×frac are excluded before picking max remaining. "
+        "Overrides kvcaware.yaml when set.",
     )
 
     args = parser.parse_args()
