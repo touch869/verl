@@ -114,6 +114,7 @@ class KVCacheAwareStrategy:
         self.load_weights = tuple(load_weights)
         self.capacity_filter_frac = float(capacity_filter_frac)
         self._max_num_seqs: int | None = None
+        self._max_num_batched_tokens: int | None = None
         logger.info(
             f"KVCacheAwareStrategy created: alpha={self.alpha:.2f}, "
             f"load_threshold={self.load_threshold:.2f}, load_weights={self.load_weights}, "
@@ -121,12 +122,16 @@ class KVCacheAwareStrategy:
             f"capacity_filter_frac={self.capacity_filter_frac}"
         )
 
-    def set_capacity(self, max_num_seqs: int) -> None:
+    def set_capacity(self, max_num_seqs: int, max_num_batched_tokens: int) -> None:
         """Inject ``--max-num-seqs`` from the server handle's rollout config."""
         if not isinstance(max_num_seqs, int) or max_num_seqs <= 0:
             raise StrategyError(f"max_num_seqs must be a positive int, got {max_num_seqs}")
+        if not isinstance(max_num_batched_tokens, int) or max_num_batched_tokens <= 0:
+            raise StrategyError(f"max_num_batched_tokens must be a positive int, got {max_num_batched_tokens}")
         self._max_num_seqs = max_num_seqs
-        logger.info(f"KVCacheAwareStrategy capacity set: max_num_seqs={max_num_seqs}")
+        self._max_num_batched_tokens = max_num_batched_tokens
+        logger.info(f"KVCacheAwareStrategy capacity set: max_num_seqs={max_num_seqs}"
+                    f"max_num_batched_tokens={max_num_batched_tokens}")
 
     @classmethod
     def from_config(cls, cfg: KVCAwareStrategyConfig) -> KVCacheAwareStrategy:
@@ -340,15 +345,17 @@ class KVCacheAwareStrategy:
         for replica in replicas:
             kv_perc = store.get_metric(replica.replica_id, MetricKey.KV_CACHE_USAGE_PERC) or 0.0
             inflight = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_COUNT) or 0
+            inflight_tokens = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_TOKENS) or 0
             s_cache, gpu_hit = self._cache_score(store, replica, prompt_ids)
             avail = cap * (1.0 - kv_perc)
             need = plen * (1.0 - gpu_hit)
-            remaining = avail - need
+            remaining = (avail - need) + (self._max_num_batched_tokens - inflight_tokens)
             rows.append(
                 {
                     "replica": replica,
                     "kv_perc": kv_perc,
                     "inflight": inflight,
+                    "inflight_tokens": inflight_tokens,
                     "gpu_hit": gpu_hit,
                     "s_cache": s_cache,
                     "avail": avail,
@@ -357,18 +364,13 @@ class KVCacheAwareStrategy:
                 }
             )
 
-        # Cold start: kv_cache_usage_perc all ~0 (metrics not polled yet) → inflight.
-        if cap == 0 or all(row["kv_perc"] < 1e-2 for row in rows):
-            top = min(range(n), key=lambda i: rows[i]["inflight"])
-            logger.info("score(): CAPACITY_TOKEN_AWARE cold-start → least-inflight")
+        thresh = cap * self.capacity_filter_frac
+        eligible = [i for i in range(n) if rows[i]["avail"] >= thresh]
+        if not eligible:
+            top = max(range(n), key=lambda i: rows[i]["remaining"])
+            logger.info("score(): CAPACITY_TOKEN_AWARE no eligible → max remaining")
         else:
-            thresh = cap * self.capacity_filter_frac
-            eligible = [i for i in range(n) if rows[i]["avail"] >= thresh]
-            if not eligible:
-                top = max(range(n), key=lambda i: rows[i]["remaining"])
-                logger.info("score(): CAPACITY_TOKEN_AWARE no eligible → max remaining")
-            else:
-                top = max(eligible, key=lambda i: rows[i]["remaining"])
+            top = max(eligible, key=lambda i: rows[i]["remaining"])
 
         for i, row in enumerate(rows):
             tag = " ← WINNER" if i == top else ""
