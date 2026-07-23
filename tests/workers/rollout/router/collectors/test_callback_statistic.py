@@ -46,6 +46,7 @@ class TestStatisticEvent:
         assert ev.request_id == "r1"
         assert ev.replica_id == "s0"
         assert ev.server_ids == ()
+        assert ev.prompt_len == 0  # default — no prompt forwarded
 
     def test_frozen(self):
         ev = StatisticEvent("on_acquire")
@@ -84,23 +85,35 @@ class TestStickyDecoder:
 
 
 class TestInflightDecoder:
-    def test_on_acquire_emits_plus_one_delta(self):
-        upd = InflightDecoder().decode(StatisticEvent("on_acquire", replica_id="s0"), "")
+    def test_on_acquire_emits_inflight_plus_dispatched_delta(self):
+        upd = InflightDecoder().decode(StatisticEvent("on_acquire", request_id="r1", replica_id="s0"), "")
         assert isinstance(upd, MetricsUpdate)
         assert upd.node_id == "s0"
-        assert upd.metrics == {MetricKey.INFLIGHT_COUNT: 1}
+        assert upd.metrics == {
+            MetricKey.INFLIGHT_COUNT: 1,
+            MetricKey.DISPATCHED_COUNT: 1,
+            MetricKey.PROMPT_LEN_SUM: 0,  # no prompt forwarded → 0 length delta
+        }
         assert upd.is_delta is True
+        assert upd.request_id == "r1"  # carried so the collector attributes the dispatch's turn
 
-    def test_on_release_emits_minus_one_delta(self):
+    def test_on_acquire_forwards_prompt_len_delta(self):
+        upd = InflightDecoder().decode(
+            StatisticEvent("on_acquire", request_id="r1", replica_id="s0", prompt_len=42), ""
+        )
+        assert upd.metrics[MetricKey.PROMPT_LEN_SUM] == 42  # len(prompt_ids) at dispatch
+
+    def test_on_release_emits_inflight_minus_completed_delta(self):
         upd = InflightDecoder().decode(StatisticEvent("on_release", replica_id="s0"), "")
         assert isinstance(upd, MetricsUpdate)
-        assert upd.metrics == {MetricKey.INFLIGHT_COUNT: -1}
+        assert upd.metrics == {MetricKey.INFLIGHT_COUNT: -1, MetricKey.COMPLETED_COUNT: 1}
         assert upd.is_delta is True
+        assert upd.request_id is None  # on_release carries no request_id
 
     def test_on_servers_removed_is_noop(self):
         # Faithful to verl: removal must NOT zero the counter — release
         # symmetry maintains it (zeroing would let a later release drive it
-        # negative).
+        # negative). Cumulative counts are lifetime totals — also left intact.
         assert InflightDecoder().decode(StatisticEvent("on_servers_removed", server_ids=["s0"]), "") is None
 
     def test_non_event_payload_returns_none(self):
@@ -180,14 +193,14 @@ class TestCollectorCallbackIntegration:
 
     @pytest.fixture(autouse=True)
     def _reset_singletons(self):
-        from verl.workers.rollout.router.kvcaware.store.metrics_store import MetricsStore
-        from verl.workers.rollout.router.kvcaware.store.sticky_session_store import StickySessionStore
+        from verl.workers.rollout.router.kvcaware.store.per_replica_store import PerReplicaStore
+        from verl.workers.rollout.router.kvcaware.store.per_request_store import PerRequestStore
 
-        StickySessionStore._instance = None
-        MetricsStore._instance = None
+        PerReplicaStore._instance = None
+        PerRequestStore._instance = None
         yield
-        StickySessionStore._instance = None
-        MetricsStore._instance = None
+        PerReplicaStore._instance = None
+        PerRequestStore._instance = None
 
     def test_sticky_collector_writes_binding_on_acquire(self):
         from verl.workers.rollout.router.kvcaware.collectors.collector import Collector
@@ -210,9 +223,84 @@ class TestCollectorCallbackIntegration:
         collector = Collector(CallbackTransport(balancer), InflightDecoder())
         collector.start()
         try:
-            balancer.callbacks["on_acquire"][0]("r1", "s0")  # +1
-            balancer.callbacks["on_acquire"][0]("r2", "s0")  # +1
-            balancer.callbacks["on_release"][0]("s0")  # -1
+            balancer.callbacks["on_acquire"][0]("r1", "s0")  # +1 inflight, +1 dispatched
+            balancer.callbacks["on_acquire"][0]("r2", "s0")  # +1 inflight, +1 dispatched
+            balancer.callbacks["on_release"][0]("s0")  # -1 inflight, +1 completed
             assert DataStore().get_metric("s0", MetricKey.INFLIGHT_COUNT) == 1
+            assert DataStore().get_metric("s0", MetricKey.DISPATCHED_COUNT) == 2
+            assert DataStore().get_metric("s0", MetricKey.COMPLETED_COUNT) == 1
         finally:
             collector.stop()
+
+    def test_inflight_collector_accumulates_prompt_len_sum(self):
+        from verl.workers.rollout.router.kvcaware.collectors.collector import Collector
+        from verl.workers.rollout.router.kvcaware.store.data_store import DataStore
+
+        balancer = _FakeBalancer()
+        collector = Collector(CallbackTransport(balancer), InflightDecoder())
+        collector.start()
+        try:
+            # on_acquire(request_id, chosen, prompt_ids) — the third arg is the
+            # prompt token-id list; its length is attributed to PROMPT_LEN_SUM.
+            balancer.callbacks["on_acquire"][0]("r1", "s0", [1, 2, 3])  # len 3
+            balancer.callbacks["on_acquire"][0]("r2", "s0", list(range(10)))  # len 10
+            balancer.callbacks["on_acquire"][0]("r3", "s1", None)  # no prompt → 0
+            ds = DataStore()
+            assert ds.get_metric("s0", MetricKey.PROMPT_LEN_SUM) == 13  # 3 + 10
+            assert ds.get_metric("s1", MetricKey.PROMPT_LEN_SUM) == 0  # no prompt forwarded
+        finally:
+            collector.stop()
+
+    def test_inflight_collector_tracks_turns_and_turn_sum(self):
+        from verl.workers.rollout.router.kvcaware.collectors.collector import Collector
+        from verl.workers.rollout.router.kvcaware.store.data_store import DataStore
+
+        balancer = _FakeBalancer()
+        collector = Collector(CallbackTransport(balancer), InflightDecoder())
+        collector.start()
+        try:
+            # r1 dispatched three times (turns 1,2,3) to s0,s1,s0; r2 once (turn 1)
+            # to s1. Each acquire also bumps INFLIGHT/DISPATCHED; the dispatch's
+            # turn is attributed to the receiving replica's TURN_SUM (the inflight
+            # collector carries request_id and does the PerRequestStore/TURN_SUM work).
+            balancer.callbacks["on_acquire"][0]("r1", "s0")
+            balancer.callbacks["on_acquire"][0]("r1", "s1")
+            balancer.callbacks["on_acquire"][0]("r1", "s0")
+            balancer.callbacks["on_acquire"][0]("r2", "s1")
+
+            ds = DataStore()
+            # per-request turn is global (Nth dispatch of that request_id overall)
+            assert ds.get_per_request("r1", "turn", 0) == 3
+            assert ds.get_per_request("r2", "turn", 0) == 1
+            # ...but each dispatch's turn is attributed to the receiving replica's
+            # TURN_SUM (per-replica, in PerReplicaStore): s0 got r1's turn-1 + turn-3 = 4;
+            # s1 got r1's turn-2 + r2's turn-1 = 3.
+            assert ds.get_metric("s0", MetricKey.TURN_SUM) == 4
+            assert ds.get_metric("s1", MetricKey.TURN_SUM) == 3
+        finally:
+            collector.stop()
+
+    def test_request_id_without_dispatch_does_not_record_turn(self):
+        """Turn is gated on DISPATCHED_COUNT (a dispatch), not request_id presence.
+
+        A hypothetical per-request delta that carries request_id but does NOT
+        bump DISPATCHED_COUNT must not touch the turn table or TURN_SUM — guards
+        against a future request_id-carrying update overloading the turn path.
+        """
+        from verl.workers.rollout.router.kvcaware.collectors.collector import Collector
+        from verl.workers.rollout.router.kvcaware.collectors.decoder import MetricsUpdate
+        from verl.workers.rollout.router.kvcaware.store.data_store import DataStore
+
+        collector = Collector(CallbackTransport(_FakeBalancer()), InflightDecoder())
+        # request_id present, but no DISPATCHED_COUNT in the delta → not a dispatch.
+        collector._write_metrics_update(
+            MetricsUpdate(
+                node_id="s0",
+                metrics={MetricKey.INFLIGHT_COUNT: 1},
+                is_delta=True,
+                request_id="r1",
+            )
+        )
+        ds = DataStore()
+        assert ds.get_per_request("r1", "turn", 0) == 0  # no dispatch → no turn recorded
+        assert ds.get_metric("s0", MetricKey.TURN_SUM) == 0

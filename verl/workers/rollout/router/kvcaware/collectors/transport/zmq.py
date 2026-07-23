@@ -251,27 +251,36 @@ class ZMQTransport(Transport):
     ) -> None:
         """Request replay of historical data for a single endpoint.
 
-        Sends "replay" request and receives msgpack-encoded response.
-        Degrades to subscription-only on failure.
+        vLLM's ROUTER replay socket expects the starting sequence number as an
+        8-byte big-endian integer — the REQ socket adds the empty delimiter frame
+        itself, so the publisher receives ``[client_id, "", start_seq]``. It then
+        streams each retained batch back as ``[seq_bytes, payload]`` frames,
+        terminated by an empty-payload ``END_SEQ`` marker. We start from seq 0 to
+        pull the whole retained buffer. Degrades to subscription-only on failure.
         """
         sockets = self._endpoint_sockets.get(node_id)
         if sockets is None or sockets.replay_socket is None:
             return
 
         try:
-            await sockets.replay_socket.send(b"replay")
+            await sockets.replay_socket.send((0).to_bytes(8, "big"))
 
-            try:
-                replay_data = await asyncio.wait_for(
-                    sockets.replay_socket.recv(),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                return  # timeout → degrade to subscription-only
+            # Drain streamed replay frames until the empty-payload end marker
+            # (or a timeout / socket error) — then degrade to subscription-only.
+            while True:
+                try:
+                    frames = await asyncio.wait_for(
+                        sockets.replay_socket.recv_multipart(),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    return  # no more frames → degrade to subscription-only
 
-            # replay_data is msgpack-encoded, pass directly to handler
-            if replay_data:
-                handler(replay_data, node_id)
+                # REQ delivers each publisher send as [seq_bytes, payload];
+                # an empty payload marks end-of-replay (vLLM END_SEQ marker).
+                if len(frames) < 2 or not frames[-1]:
+                    return
+                handler(frames[-1], node_id)
 
         except zmq.ZMQError as exc:
             logger.warning(f"ZMQ replay error for node {node_id}: {exc}")

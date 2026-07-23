@@ -79,3 +79,30 @@ def test_clear_event_sets_clear_all():
 
     assert update is not None
     assert update.clear_all is True
+
+
+def test_decode_failure_surfaces_exception_not_swallowed():
+    """A malformed payload returns None and logs the real error.
+
+    Regression: the ``except`` used a non-f-string with an unbound ``{exc}``,
+    so the warning rendered the literal text ``"{exc}"`` and the actual decode
+    error was silently lost.
+    """
+    from loguru import logger as loguru_logger
+
+    decoder = VLLMKVDecoder()
+    # 0xc1 is a reserved/invalid msgpack byte → unpackb raises UnpackException,
+    # exercising the failed-to-decode branch (not the unexpected-format branch).
+    garbage = b"\xc1\xc1\xc1"
+    msgs: list[str] = []
+    sink_id = loguru_logger.add(msgs.append, level="WARNING", format="{message}")
+    try:
+        update = decoder.decode(garbage, "node1")
+    finally:
+        loguru_logger.remove(sink_id)
+
+    assert update is None
+    text = "\n".join(msgs)
+    assert "{exc}" not in text  # placeholder must be gone
+    assert "node1" in text  # node_id must interpolate
+    assert "len=" in text and "head=c1c1c1" in text  # diagnostic preview present

@@ -74,7 +74,7 @@ class VLLMKVDecoder(Decoder):
             raw = msgpack.unpackb(raw_data, raw=False)
 
             if not isinstance(raw, list) or len(raw) == 0:
-                logger.warning("Unexpected msgpack format from node {node_id}")
+                logger.warning(f"Unexpected msgpack format from node {node_id} (type={type(raw).__name__})")
                 return None
             event_payloads = raw if isinstance(raw[0], list) else [raw]
 
@@ -92,8 +92,11 @@ class VLLMKVDecoder(Decoder):
                         raise ValueError(f"Unknow event.event_type {event.event_type}.")
             return update
 
-        except (msgpack.UnpackException, ValueError, TypeError):
-            logger.warning("Failed to decode msgpack payload from node {node_id}: {exc}")
+        except (msgpack.UnpackException, ValueError, TypeError) as exc:
+            preview = bytes(raw_data[:32]).hex() if isinstance(raw_data, bytes | bytearray) else str(raw_data)[:64]
+            logger.warning(
+                f"Failed to decode msgpack payload from node {node_id}: {exc!r} (len={len(raw_data)}, head={preview})"
+            )
             return None
 
     @classmethod

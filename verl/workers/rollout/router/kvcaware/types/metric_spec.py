@@ -64,6 +64,22 @@ class MetricKey:
     ESTIMATED_FLOPS_PER_GPU: str = "estimated_flops_per_gpu"
     # In-flight request count (acquire +1 / release -1, mirrors verl least-inflight).
     INFLIGHT_COUNT: str = "inflight_count"
+    # Cumulative dispatched request count (acquire +1) — the running inflight
+    # gauge's monotonic sibling. Per-replica; sum across replicas for the global
+    # dispatched volume. Paired with COMPLETED_COUNT for dispatch/complete rates.
+    DISPATCHED_COUNT: str = "dispatched_count"
+    # Cumulative completed request count (release +1). Per-replica; paired with
+    # DISPATCHED_COUNT — completed/dispatched ratio is the realized-throughput share.
+    COMPLETED_COUNT: str = "completed_count"
+    # Cumulative sum of per-request turn at dispatch, per replica. Each dispatch's
+    # turn (Nth time that request_id was dispatched globally) is added to the
+    # receiving replica's TURN_SUM. Windowed avg turn = Δturn_sum / Δdispatched.
+    TURN_SUM: str = "turn_sum"
+    # Cumulative sum of dispatched prompt lengths (len(prompt_ids)), per replica.
+    # Each dispatch adds the request's input prompt length to the receiving
+    # replica's PROMPT_LEN_SUM. Windowed avg prompt len = Δsum / Δdispatched — the
+    # request-size signal the router sees at dispatch time (pre-engine).
+    PROMPT_LEN_SUM: str = "prompt_len_sum"
 
 
 # ── Metric definitions (single source of truth) ──────────────────────
@@ -161,5 +177,25 @@ METRIC_SPECS: dict[str, dict[str, Any]] = {
         "default": 0,
         "value_type": int,
         "describe": "In-flight request count (acquire +1 / release -1, verl least-inflight signal)",
+    },
+    MetricKey.DISPATCHED_COUNT: {
+        "default": 0,
+        "value_type": int,
+        "describe": "Cumul. dispatched requests per replica (acquire +1) — pair with COMPLETED_COUNT for rates",
+    },
+    MetricKey.COMPLETED_COUNT: {
+        "default": 0,
+        "value_type": int,
+        "describe": "Cumul. completed requests per replica (release +1) — realized-throughput share",
+    },
+    MetricKey.TURN_SUM: {
+        "default": 0,
+        "value_type": int,
+        "describe": "Cumul. sum of per-request turn at dispatch, per replica (avg turn = Δturn_sum/Δdispatched)",
+    },
+    MetricKey.PROMPT_LEN_SUM: {
+        "default": 0,
+        "value_type": int,
+        "describe": "Cumul. sum of dispatched prompt lengths, per replica (avg len = Δsum/Δdispatched)",
     },
 }

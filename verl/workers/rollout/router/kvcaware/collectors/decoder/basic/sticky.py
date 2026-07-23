@@ -17,7 +17,7 @@
 Fed by ``CallbackTransport``, which packs each Balancer callback into a
 ``StatisticEvent``. The decoder is stateless — it dispatches on the event
 type and emits a ``StickyUpdate``; the ``Collector`` applies it to the
-``StickySessionStore`` via ``DataStore``.
+per-request store via ``DataStore``.
 
 Event → action mapping:
 - ``on_acquire(request_id, replica_id)``     → ``put`` (bind/refresh)
@@ -36,7 +36,7 @@ logger = get_router_logger("sticky-decoder")
 
 
 class StickyDecoder(Decoder):
-    """Decode ``StatisticEvent`` → ``StickyUpdate`` for the sticky-session store."""
+    """Decode ``StatisticEvent`` → ``StickyUpdate`` for sticky bindings."""
 
     def decode(self, raw_data: bytes | str | Any, node_id: str) -> StickyUpdate | None:
         """Dispatch on the event type; ignore non-event payloads."""

@@ -20,8 +20,10 @@ from typing import Any
 
 from ..types import Layer, MetricKey
 from .kv_cache_store import KVCacheStore
-from .metrics_store import MetricsStore
-from .sticky_session_store import StickySessionStore
+from .per_replica_store import PerReplicaStore
+from .per_request_store import PerRequestStore
+
+_STICKY_KEY = "sticky_replica"
 
 
 class DataStore:
@@ -41,13 +43,11 @@ class DataStore:
     """
 
     def __init__(self) -> None:
-        self._metrics = MetricsStore.singleton()
+        self._metrics = PerReplicaStore.singleton()
         self._kv = KVCacheStore.singleton()
-        # Sticky capacity is a code constant (DEFAULT_STICKY_MAX_SIZE), not
-        # configurable — see StickySessionStore.singleton().
-        self._sticky = StickySessionStore.singleton()
+        self._per_request = PerRequestStore.singleton()
 
-    # ── MetricsStore operations ─────────────────────────────────────────
+    # ── PerReplicaStore operations ─────────────────────────────────────────
 
     def get_metric(self, node_id: str, key: str) -> Any:
         """Query a single metric by canonical key.
@@ -196,39 +196,59 @@ class DataStore:
         """
         return self._kv.per_replica_block_counts()
 
-    # ── MetricsStore incremental write ──────────────────────────────────
+    # ── PerReplicaStore incremental write ──────────────────────────────────
 
     def incr_metric(self, node_id: str, key: str, delta: int | float = 1) -> None:
         """Apply a signed delta to one metric for one node (inflight ±1).
 
-        Routes to ``MetricsStore.incr`` (not ``refresh``) so a stateless delta
+        Routes to ``PerReplicaStore.incr`` (not ``refresh``) so a stateless delta
         emitter (``InflightDecoder``) can move a running counter without
         tracking the absolute value itself.
         """
         self._metrics.incr(node_id, key, delta)
 
-    # ── StickySessionStore operations ───────────────────────────────────
+    def incr_metrics(self, node_id: str, deltas: dict[str, int | float]) -> None:
+        """Apply multiple signed deltas to one node under a single lock.
+
+        Batched variant of :meth:`incr_metric` for the ``on_acquire`` decoder,
+        which emits several deltas per dispatch (INFLIGHT / DISPATCHED /
+        PROMPT_LEN_SUM) — batching avoids one lock cycle per key on the hot path.
+        """
+        self._metrics.incr_many(node_id, deltas)
+
+    # ── Sticky bindings (a per-request value stored under _STICKY_KEY) ───
 
     def get_sticky_binding(self, request_id: str) -> str | None:
-        """Return the bound replica_id for ``request_id`` (None if cold/evicted).
-
-        Strategies read sticky affinity through this single entry point.
-        Refreshes LRU recency on hit.
-        """
-        return self._sticky.get(request_id)
+        """Return the bound replica_id for ``request_id`` (None if cold/evicted)."""
+        return self._per_request.get(request_id, _STICKY_KEY)
 
     def put_sticky_binding(self, request_id: str, replica_id: str) -> None:
         """Bind / refresh ``request_id → replica_id`` (driven by ``on_acquire``)."""
-        self._sticky.put(request_id, replica_id)
+        self._per_request.set(request_id, _STICKY_KEY, replica_id)
 
     def invalidate_sticky_binding(self, request_id: str) -> None:
-        """Drop one request_id's binding (per-request expiry)."""
-        self._sticky.invalidate(request_id)
+        """Drop one request_id's sticky binding."""
+        self._per_request.delete(request_id, _STICKY_KEY)
 
     def invalidate_sticky_replica(self, replica_id: str) -> None:
-        """Drop every binding pointing at a removed replica (``on_servers_removed``)."""
-        self._sticky.invalidate_replica(replica_id)
+        """Drop every sticky binding pointing at a removed replica."""
+        self._per_request.delete_where(_STICKY_KEY, replica_id)
 
     def sticky_status(self) -> dict:
-        """Return a debugging snapshot of the sticky table state."""
-        return self._sticky.status()
+        """Return a debugging snapshot of the sticky bindings."""
+        return {"max_size": self._per_request.max_size, "size": self._per_request.count(_STICKY_KEY)}
+
+    # ── PerRequestStore operations ─────────────────────────────────────
+
+    def incr_per_request(self, request_id: str, key: str, delta: int | float = 1):
+        """Apply a signed delta to one per-request value; return the new value.
+
+        Routes to ``PerRequestStore.incr`` — the per-request store is a generic
+        ``request_id → {key: value}`` scratch space (not tied to any one metric),
+        so the caller owns ``key`` and its semantics. Mirrors ``incr_metric``.
+        """
+        return self._per_request.incr(request_id, key, delta)
+
+    def get_per_request(self, request_id: str, key: str, default: Any = None):
+        """Return one per-request value (``default`` if unset/evicted)."""
+        return self._per_request.get(request_id, key, default)

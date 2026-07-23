@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import Future
 
@@ -34,6 +35,12 @@ logger = get_router_logger("collector")
 # default 1 s polling interval × a few replicas). Lets us compare what the
 # collector feeds the router against vllm's own engine-stats log.
 _METRICS_LOG_EVERY_POLLS = 30
+
+# Emit the per-replica dispatched/completed/turn_sum snapshot (the
+# `router-dispatch` log line) at most this often (seconds). Time-throttled so
+# the cadence is load-independent; checked on each acquire/release, so idle
+# stretches emit nothing.
+_DISPATCH_LOG_INTERVAL_S = 5.0
 
 # Cumulative metrics tracked for windowed deltas in the evidence log. Single
 # source of truth — ``_delta`` consumers below read these by key, and the
@@ -95,6 +102,8 @@ class Collector:
         self._kv_event_counts: dict[str, int] = defaultdict(int)
         self._kv_block_counts: dict[str, int] = defaultdict(int)
         self._kv_last_logged_total = 0
+        # Last-emit time for the dispatched/completed/turn_sum snapshot (throttled).
+        self._dispatch_last_log: float = 0.0
 
     # ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -175,13 +184,28 @@ class Collector:
     def _write_metrics_update(self, update: MetricsUpdate) -> None:
         """Write MetricsUpdate via DataStore, then emit a periodic evidence log.
 
-        Delta updates (``is_delta=True``, from ``InflightDecoder``) route to
-        ``incr_metric`` and skip the evidence log — they are signed counter
-        deltas (±1), not polled gauges.
+        Delta updates route to ``incr_metric``; a dispatch (DISPATCHED_COUNT
+        bumped) also records its turn to ``TURN_SUM``. Both acquire and release
+        refresh the throttled ``router-dispatch`` snapshot. Absolute (non-delta)
+        updates are polled gauges → evidence-log path below.
         """
         if update.is_delta:
-            for key, delta in update.metrics.items():
-                self._data_store.incr_metric(update.node_id, key, delta)
+            # Batch the decoder's signed deltas in ONE locked PerReplica write.
+            # An on_acquire update carries INFLIGHT/DISPATCHED/PROMPT_LEN_SUM;
+            # a dispatch (DISPATCHED_COUNT bumped) also folds in TURN_SUM. Turn
+            # fires only on a dispatch, not on request_id presence — a
+            # request_id-carrying non-dispatch update must not be mis-counted.
+            # The turn lookup runs first (it lives in PerRequestStore, a
+            # separate lock) so its result can join this batch instead of
+            # needing a second PerReplica lock cycle.
+            deltas = dict(update.metrics)
+            if MetricKey.DISPATCHED_COUNT in deltas:
+                if update.request_id is None:
+                    logger.debug("dispatch (DISPATCHED_COUNT) update missing request_id — skipping turn")
+                else:
+                    deltas[MetricKey.TURN_SUM] = self._data_store.incr_per_request(update.request_id, "turn")
+            self._data_store.incr_metrics(update.node_id, deltas)
+            self._maybe_log_dispatch_stats()
             return
         self._data_store.refresh_metrics({update.node_id: update.metrics})
 
@@ -199,7 +223,7 @@ class Collector:
                 self._log_evidence_window(nid)
 
     def _write_sticky_update(self, update: StickyUpdate) -> None:
-        """Apply a StickyUpdate to the sticky-session store via DataStore."""
+        """Apply a StickyUpdate to the per-request store (sticky key) via DataStore."""
         if update.action == "put":
             self._data_store.put_sticky_binding(update.request_id, update.replica_id)
         elif update.action == "invalidate":
@@ -209,6 +233,31 @@ class Collector:
                 self._data_store.invalidate_sticky_replica(rid)
         else:
             logger.warning(f"unknown StickyUpdate action: {update.action}")
+
+    def _maybe_log_dispatch_stats(self) -> None:
+        """Emit per-replica dispatched/completed/turn_sum/prompt_len_sum counters at most every interval.
+
+        Reads each dispatched replica's cumulative counters from PerReplicaStore and
+        logs them (the ``router-dispatch`` line); the plot derives trailing-5-min
+        dispatched / completed / avg-turn / RPM / avg-prompt-len from their per-replica
+        deltas. Time-throttled so the cadence is load-independent (idle stretches emit nothing).
+        """
+        now = time.monotonic()
+        if now - self._dispatch_last_log < _DISPATCH_LOG_INTERVAL_S:
+            return
+        self._dispatch_last_log = now
+        for rep in self._data_store.get_metric_node_ids():
+            snap = self._data_store.get_metrics(rep)
+            dispatched = snap.get(MetricKey.DISPATCHED_COUNT, 0)
+            if not dispatched:  # skip replicas that never received a dispatch
+                continue
+            completed = snap.get(MetricKey.COMPLETED_COUNT, 0)
+            turn_sum = snap.get(MetricKey.TURN_SUM, 0)
+            prompt_len_sum = snap.get(MetricKey.PROMPT_LEN_SUM, 0)
+            logger.info(
+                f"router-dispatch replica={rep} dispatched={dispatched} completed={completed} "
+                f"turn_sum={turn_sum} prompt_len_sum={prompt_len_sum}"
+            )
 
     def _log_evidence_window(self, node_id: str) -> None:
         """Emit a windowed evidence summary for one replica.

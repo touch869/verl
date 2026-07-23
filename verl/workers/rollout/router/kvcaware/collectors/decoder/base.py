@@ -71,7 +71,7 @@ class KVCacheUpdate:
 
 @dataclass
 class MetricsUpdate:
-    """Structured update command for MetricsStore.
+    """Structured update command for PerReplicaStore.
 
     Attributes:
         node_id: Target endpoint identifier.
@@ -81,16 +81,19 @@ class MetricsUpdate:
             ``True`` (``InflightDecoder``) the values are signed deltas applied
             via ``incr`` — keeps the decoder stateless (it emits only ±1; the
             store owns the running counter).
+        request_id: Optional routing request id carried with the update
+            (``None`` when the update isn't request-scoped).
     """
 
     node_id: str
     metrics: dict[str, Any]
     is_delta: bool = False
+    request_id: str | None = None
 
 
 @dataclass
 class StickyUpdate:
-    """Structured update command for StickySessionStore (per-request LRU).
+    """Structured update command for the per-request store (sticky binding).
 
     Emitted by ``StickyDecoder`` from the Balancer's ``on_acquire`` /
     ``on_servers_removed`` callbacks (packed into a ``StatisticEvent`` by
@@ -116,7 +119,8 @@ class Decoder(ABC):
     """Abstract base for data decoders.
 
     Subclasses implement ``decode()`` with their backend-specific parsing logic,
-    returning a ``KVCacheUpdate`` or ``MetricsUpdate`` (or ``None`` on failure).
+    returning a ``KVCacheUpdate`` / ``MetricsUpdate`` / ``StickyUpdate``
+    (or ``None`` on failure).
     """
 
     @abstractmethod

@@ -23,6 +23,7 @@ and unit-testable, satisfying the ``RequestLoadBalancer`` Protocol.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Optional
 
 import ray
@@ -45,6 +46,9 @@ logger = get_router_logger("balancer")
 class KVCAwareBalancer:
     """Pure-framework router shell. See module docstring."""
 
+    # Emit a route() latency aggregate every N route() calls to bound log volume.
+    _ROUTE_LOG_EVERY = 64
+
     def __init__(self, servers: dict[str, Any], config: Optional[dict] = None) -> None:
         if not servers:
             raise ValueError("servers must be non-empty")
@@ -53,6 +57,7 @@ class KVCAwareBalancer:
         self._strategies: list[tuple[Any, float]] = [
             (StrategyRegistry.get(type(cfg)).from_config(cfg), cfg.weight) for cfg in self._config.strategies
         ]
+        self._strategy_summary = self._build_strategy_summary(self._config.strategies)
         self._servers: dict[str, Any] = dict(servers)
         max_num_seqs = self._resolve_max_num_seqs()
         for strategy, _ in self._strategies:
@@ -60,6 +65,11 @@ class KVCAwareBalancer:
                 strategy.set_capacity(max_num_seqs)
         logger.info(f"KVCAwareBalancer: max_num_seqs={max_num_seqs}")
         self._route_calls = 0
+        # route() latency profiling — cumulative stats flushed every _ROUTE_LOG_EVERY calls.
+        # The flush trigger derives from _route_calls % _ROUTE_LOG_EVERY (a separate
+        # since-flush counter would just track it in lockstep).
+        self._route_time_total_s = 0.0
+        self._route_time_max_ms = 0.0
         self._callbacks: dict[str, list[Callable]] = {
             "on_acquire": [],
             "on_release": [],
@@ -67,6 +77,23 @@ class KVCAwareBalancer:
         }
         self._store = DataStore()
         self._init_manager()
+
+    @staticmethod
+    def _build_strategy_summary(strategies: list[Any]) -> str:
+        """One-line summary of the first (primary) strategy's key params.
+
+        Only the KVCacheAware tuning knobs that affect routing decisions are
+        surfaced: alpha / load_threshold / memory_overload_filter / slow_cut.
+        """
+        cfg = strategies[0]
+        name = type(cfg).__name__
+        bits = []
+        for k in ("alpha", "load_threshold", "memory_overload_filter"):
+            if hasattr(cfg, k):
+                bits.append(f"{k}={getattr(cfg, k)}")
+        if hasattr(cfg, "slow_cut"):
+            bits.append(f"slow_cut={cfg.slow_cut.value}")
+        return f"{name}({', '.join(bits)})"
 
     def _resolve_max_num_seqs(self, default: int = 256) -> int:
         for handle in self._servers.values():
@@ -178,6 +205,7 @@ class KVCAwareBalancer:
         """
         replicas = [ReplicaInfo(replica_id=sid) for sid in self._servers]
         self._route_calls += 1
+        t0 = time.perf_counter()
         ranking = route(
             self._strategies,
             prompt_ids,
@@ -185,13 +213,24 @@ class KVCAwareBalancer:
             replicas,
             request_id,
         )
+        dt_ms = (time.perf_counter() - t0) * 1000
+        self._route_time_total_s += dt_ms / 1000.0
+        self._route_time_max_ms = max(self._route_time_max_ms, dt_ms)
         if not ranking:
             raise RuntimeError("no available replica to route to")
         server_id = ranking[0]
-        self._fire("on_acquire", request_id, server_id)
+        self._fire("on_acquire", request_id, server_id, prompt_ids)
         logger.info(
-            f"request={request_id} routed to server={server_id} (ranking={ranking}, pool={list(self._servers)})",
+            f"request={request_id} routed to server={server_id} (ranking={ranking}, pool={list(self._servers)}, "
+            f"route={dt_ms:.2f}ms, strategy=[{self._strategy_summary}])"
         )
+        if self._route_calls % self._ROUTE_LOG_EVERY == 0:
+            logger.info(
+                f"route-stats: calls={self._ROUTE_LOG_EVERY} total={self._route_time_total_s:.3f}s "
+                f"mean={self._route_time_total_s * 1000 / max(self._route_calls, 1):.2f}ms "
+                f"max={self._route_time_max_ms:.2f}ms (flushed every {self._ROUTE_LOG_EVERY} calls) "
+                f"strategy=[{self._strategy_summary}]"
+            )
         return server_id, self._servers[server_id]
 
     def add_servers(self, servers: dict[str, Any]) -> None:

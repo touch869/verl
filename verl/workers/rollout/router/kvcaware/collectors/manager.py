@@ -15,7 +15,7 @@
 """CollectorManager — constructs and runs data collectors.
 
 Owns collector construction and lifecycle (start/stop). Strategies read metrics
-from ``DataStore`` (the unified facade over ``MetricsStore`` / ``KVCacheStore``),
+from ``DataStore`` (the unified facade over ``PerReplicaStore`` / ``KVCacheStore``),
 not from the manager.
 """
 
