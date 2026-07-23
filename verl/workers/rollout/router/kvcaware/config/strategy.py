@@ -41,6 +41,11 @@ class KVCAwareStrategyConfig(StrategyConfig):
     memory_overload_filter: bool = True
     # Fallback scoring mode used after the sticky short-circuit misses.
     slow_cut: SlowCut = SlowCut.PREFIX_LOAD_AWARE
+    # Capacity-gate fraction (CAPACITY_TOKEN_AWARE only): replicas whose free
+    # token capacity ``cap × (1 - kv_cache_usage_perc)`` is below
+    # ``cap × capacity_filter_frac`` are excluded before picking the one with
+    # the largest remaining capacity after assigning this request's prefill.
+    capacity_filter_frac: float = 0.05
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -48,6 +53,8 @@ class KVCAwareStrategyConfig(StrategyConfig):
             raise ConfigError(f"load_threshold must be in (0, 1), got {self.load_threshold}")
         if not isinstance(self.memory_overload_filter, bool):
             raise ConfigError(f"memory_overload_filter must be a bool, got {self.memory_overload_filter!r}")
+        if not 0.0 <= self.capacity_filter_frac < 1.0:
+            raise ConfigError(f"capacity_filter_frac must be in [0, 1), got {self.capacity_filter_frac}")
         # Normalize yaml str → SlowCut (also validates the value is a known mode).
         try:
             self.slow_cut = SlowCut(self.slow_cut)
