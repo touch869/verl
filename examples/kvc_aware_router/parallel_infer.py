@@ -60,7 +60,6 @@ def init_config(args: argparse.Namespace) -> DictConfig:
     # oc.select-derived from the data / trainer nodes set below, so not repeated).
     rollout.agent.agent_loop_config_path = os.path.expanduser(args.agent_config_path)
     rollout.agent.num_workers = args.num_workers
-    rollout.multi_turn.max_assistant_turns = args.max_turns
     rollout.temperature = args.temperature
     rollout.top_p = args.top_p
     rollout.nnodes = args.nnodes
@@ -69,8 +68,7 @@ def init_config(args: argparse.Namespace) -> DictConfig:
     rollout.tensor_model_parallel_size = args.tensor_parallel_size
     rollout.gpu_memory_utilization = 0.8
     rollout.max_num_seqs = args.max_num_seqs
-    if args.max_model_len is not None:
-        rollout.max_model_len = args.max_model_len
+    rollout.max_model_len = args.max_model_len
     rollout.disable_log_stats = False  # expose engine metrics on /metrics for the kvcaware collector
 
     # Hardware (rollout.n_gpus_per_node derives from trainer via oc.select)
@@ -79,8 +77,9 @@ def init_config(args: argparse.Namespace) -> DictConfig:
 
     config.actor_rollout_ref.model.path = os.path.expanduser(args.model_path)
 
-    # Data (rollout.prompt_length / response_length derive from these via oc.select)
-    config.data.max_prompt_length = args.prompt_length
+    # Data (rollout.prompt_length / response_length derive from these via oc.select).
+    prompt_length = args.max_model_len - args.response_length - 100
+    config.data.max_prompt_length = prompt_length
     config.data.max_response_length = args.response_length
 
     # vLLM engine kwargs: MFU metric (always on) + optional mooncake connector / kv-events.
@@ -232,9 +231,7 @@ def main():
         help="Optional path to write a JSON result file (mean reward and per-rollout scores).",
     )
     # Inference parameters
-    parser.add_argument("--max-turns", type=int, default=100, help="Maximum number of interaction turns per episode.")
-    parser.add_argument("--prompt-length", type=int, default=4096, help="Maximum prompt length (tokens).")
-    parser.add_argument("--response-length", type=int, default=8192, help="Maximum response length (tokens).")
+    parser.add_argument("--response-length", type=int, required=True, help="Maximum response length (tokens).")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Sampling top-p (nucleus sampling).")
     parser.add_argument("--n", type=int, default=1, help="Number of rollouts per prompt (N).")
@@ -275,8 +272,8 @@ def main():
     parser.add_argument(
         "--max-model-len",
         type=int,
-        default=None,
-        help="Maximum model context length (tokens). If unset the engine default is used.",
+        required=True,
+        help="Maximum model context length (tokens).",
     )
     parser.add_argument(
         "--max-num-seqs",
